@@ -26,7 +26,11 @@ cargo build --release
 ```
 
 - ヘッダにホスト名・時刻・タブ・各コレクタの稼働状況(緑=稼働/赤=未publish)を表示。
-- タブ: `Tab`/`1`/`2` で **Overview**(ダッシュボード)と **Processes**(PID一覧)を切替。Processes は `s` でソート(CPU/MEM/PID)、`↑↓` でスクロール。
+- タブ: `Tab`/`1`/`2` で **Overview**(ダッシュボード)と **Processes**(PID一覧)を切替。
+  - Processes 列: PID / CPU% / MEM / DISK R / DISK W / STATE / COMMAND。
+  - ソート: `s` 巡回、または `c`(CPU)/`m`(MEM)/`d`(DISK)/`p`(PID)。`↑↓` でスクロール。アクティブ列は `▾` で表示。
+  - DISK I/O は `/proc/<pid>/io` 由来。**他ユーザのプロセスは root か `setcap cap_sys_ptrace+ep mon` が必要**(無いと自分のプロセスのみ、他は空欄)。
+  - プロセス毎の **Network 帯域は非対応**(procfs にPID毎の帯域が無く、pcap/eBPF + root が必要なため)。
 - NVIDIA対応は `nvidia` feature（デフォルト有効）。`nvml-wrapper` が `libnvidia-ml` を**実行時dlopen**するため、ドライバが無い環境でもビルド・実行でき、その場合 NVIDIA GPU は単に表示されない。
 - NVMLを完全に外したい場合: `cargo build --release --no-default-features`
 
