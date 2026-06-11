@@ -27,9 +27,10 @@ cargo build --release
 
 - ヘッダにホスト名・時刻・タブ・各コレクタの稼働状況(緑=稼働/赤=未publish)を表示。
 - タブ: `Tab`/`1`/`2` で **Overview**(ダッシュボード)と **Processes**(PID一覧)を切替。
-  - Processes 列: PID / CPU% / MEM / DISK R / DISK W / STATE / COMMAND。
-  - ソート: `s` 巡回、または `c`(CPU)/`m`(MEM)/`d`(DISK)/`p`(PID)。`↑↓` でスクロール。アクティブ列は `▾` で表示。
-  - DISK I/O は `/proc/<pid>/io` 由来。**他ユーザのプロセスは root か `setcap cap_sys_ptrace+ep mon` が必要**(無いと自分のプロセスのみ、他は空欄)。
+  - Processes 列: PID / CPU% / MEM / DISK R / DISK W / **GPU**(どのGPU+使用率, 例 `N0 45%`)/ **VRAM** / STATE / COMMAND。
+  - ソート: `s` 巡回、または `c`(CPU)/`m`(MEM)/`d`(DISK R)/`D`(DISK W)/`g`(GPU%)/`G`(VRAM)/`p`(PID)。`↑↓` でスクロール。アクティブ列は `▾`。
+  - GPU per-process: **NVIDIA は NVML 経由で全プロセス**(VRAM + SM%)。**AMD は `/proc/<pid>/fdinfo`**(`drm-total-vram` / `drm-engine-*`、`drm-client-id` で重複排除)で、DISK I/O 同様 **他ユーザは root か `setcap cap_sys_ptrace+ep mon` が必要**。使用率はアクティブ時のみ(アイドルは0)。
+  - DISK I/O は `/proc/<pid>/io` 由来。**他ユーザのプロセスは root か `setcap cap_sys_ptrace+ep mon` が必要**(無いと自分のプロセスのみ、他は `n/a`)。
   - プロセス毎の **Network 帯域は非対応**(procfs にPID毎の帯域が無く、pcap/eBPF + root が必要なため)。
 - NVIDIA対応は `nvidia` feature（デフォルト有効）。`nvml-wrapper` が `libnvidia-ml` を**実行時dlopen**するため、ドライバが無い環境でもビルド・実行でき、その場合 NVIDIA GPU は単に表示されない。
 - NVMLを完全に外したい場合: `cargo build --release --no-default-features`
