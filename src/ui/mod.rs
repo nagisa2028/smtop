@@ -3,8 +3,8 @@
 mod widgets;
 
 use std::io;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use ratatui::DefaultTerminal;
@@ -30,32 +30,46 @@ pub fn run(state: Arc<SharedState>, shutdown: Arc<AtomicBool>) -> io::Result<()>
 }
 
 fn run_loop(terminal: &mut DefaultTerminal, state: &SharedState) -> io::Result<()> {
+    let mut paused = false;
+    let mut redraw = true;
     loop {
-        terminal.draw(|frame| render(frame, state))?;
+        // While paused the screen is frozen; only redraw on toggle/resize.
+        if !paused || redraw {
+            terminal.draw(|frame| render(frame, state, paused))?;
+            redraw = false;
+        }
         if event::poll(Duration::from_millis(FRAME_MS))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-                match key.code {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         return Ok(());
                     }
+                    KeyCode::Char(' ') => {
+                        paused = !paused;
+                        redraw = true;
+                    }
                     _ => {}
-                }
+                },
+                Event::Resize(_, _) => redraw = true,
+                _ => {}
             }
         }
     }
 }
 
-fn render(frame: &mut Frame, state: &SharedState) {
-    let area = frame.area();
-    if area.width < 50 || area.height < 18 {
+fn render(frame: &mut Frame, state: &SharedState, paused: bool) {
+    let full = frame.area();
+    if full.width < 50 || full.height < 18 {
         let p = Paragraph::new("terminal too small — resize (≥50×18)").style(Style::new().fg(Color::Yellow));
-        frame.render_widget(p, area);
+        frame.render_widget(p, full);
         return;
     }
+
+    // Reserve the top row for a header, tiers fill the rest.
+    let split = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(full);
+    render_header(frame, split[0], state, paused);
+    let area = split[1];
 
     // Responsive tier heights. The CPU tier grows to fit the per-core grid
     // (which expands with core/socket count), keeping ≥6 rows for GPUs.
@@ -192,6 +206,54 @@ fn cpu_core_rows(groups: &[CoreGroup], inner_w: usize) -> usize {
 /// per second). The top label is the current windowed peak.
 fn rate_labels(peak: f64) -> Vec<Line<'static>> {
     vec![Line::from("0"), Line::from(fmt_bytes(peak.max(0.0) as u64))]
+}
+
+/// System hostname (read once from sysctl).
+fn hostname() -> &'static str {
+    static HOST: OnceLock<String> = OnceLock::new();
+    HOST.get_or_init(|| {
+        std::fs::read_to_string("/proc/sys/kernel/hostname")
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|_| "?".into())
+    })
+}
+
+/// Top header: identity, clock, per-collector liveness, key hints.
+fn render_header(frame: &mut Frame, area: Rect, state: &SharedState, paused: bool) {
+    let now = chrono::Local::now().format("%H:%M:%S");
+    let mut spans = vec![
+        Span::styled("mon", Style::new().fg(Color::Cyan).bold()),
+        Span::raw(" "),
+        Span::styled(hostname(), Style::new().fg(Color::White)),
+        Span::styled(format!("  {now}  "), Style::new().add_modifier(Modifier::DIM)),
+    ];
+    // Liveness: green once a collector has published, red if it never has.
+    let mut stat = |label: &str, alive: bool| {
+        spans.push(Span::styled(
+            format!("{label} "),
+            Style::new().fg(if alive { Color::Green } else { Color::Red }),
+        ));
+    };
+    let gpu_alive =
+        state.nvidia.load_full().is_some() || state.amd.load_full().is_some();
+    stat("cpu", state.cpu.load_full().is_some());
+    stat("gpu", gpu_alive);
+    stat("net", state.net.load_full().is_some());
+    stat("disk", state.disk.load_full().is_some());
+    stat("fs", state.fs.load_full().is_some());
+    if paused {
+        spans.push(Span::styled(
+            " PAUSED ",
+            Style::new().fg(Color::Black).bg(Color::Yellow),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    frame.render_widget(
+        Paragraph::new("space:pause  q:quit")
+            .alignment(Alignment::Right)
+            .style(Style::new().add_modifier(Modifier::DIM)),
+        area,
+    );
 }
 
 fn render_cpu(frame: &mut Frame, area: Rect, cpu: &CpuSnapshot) {
@@ -405,7 +467,10 @@ fn render_gpu_card(frame: &mut Frame, area: Rect, g: &GpuSnapshot) {
         rows[1],
     );
 
-    let mut stats: Vec<Span> = if g.suspended {
+    let mut stats: Vec<Span> = if let Some(note) = &g.note {
+        // Telemetry is missing for an explained reason — show it instead of 0%.
+        vec![Span::styled(format!("⚠ {note}"), Style::new().fg(Color::Yellow))]
+    } else if g.suspended {
         vec![Span::styled("⏾ idle (suspended)", Style::new().fg(Color::DarkGray))]
     } else {
         vec![Span::styled(

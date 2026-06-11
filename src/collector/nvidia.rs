@@ -44,7 +44,7 @@ impl Collector for NvidiaCollector {
     }
 
     fn interval(&self) -> Duration {
-        Duration::from_millis(1000)
+        super::sample_interval()
     }
 
     fn sample(&mut self) -> anyhow::Result<Vec<GpuSnapshot>> {
@@ -109,6 +109,7 @@ impl Collector for NvidiaCollector {
                 pcie_tx_bps,
                 pcie_width,
                 suspended: false,
+                note: None,
             });
         }
         Ok(out)

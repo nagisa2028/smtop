@@ -53,7 +53,7 @@ impl Collector for FsCollector {
 
     fn interval(&self) -> Duration {
         // Free space changes slowly; sample less often than rates.
-        Duration::from_millis(5000)
+        super::sample_interval() * 5
     }
 
     fn sample(&mut self) -> anyhow::Result<Vec<FsSnapshot>> {
@@ -88,7 +88,7 @@ impl Collector for FsCollector {
             out.push(FsSnapshot { mount, used, total });
         }
         // Largest filesystems first.
-        out.sort_by(|a, b| b.total.cmp(&a.total));
+        out.sort_by_key(|f| std::cmp::Reverse(f.total));
         Ok(out)
     }
 }

@@ -72,7 +72,7 @@ impl Collector for CpuCollector {
     }
 
     fn interval(&self) -> Duration {
-        Duration::from_millis(1000)
+        super::sample_interval()
     }
 
     fn sample(&mut self) -> anyhow::Result<CpuSnapshot> {
@@ -168,11 +168,10 @@ fn read_topology() -> Vec<CoreGroup> {
         for entry in rd.flatten() {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if let Some(num) = name.strip_prefix("cpu") {
-                if let Ok(i) = num.parse::<usize>() {
+            if let Some(num) = name.strip_prefix("cpu")
+                && let Ok(i) = num.parse::<usize>() {
                     cpus.push(i);
                 }
-            }
         }
     }
     cpus.sort_unstable();
@@ -224,11 +223,10 @@ fn read_cpu_temp() -> Option<f32> {
                 for i in 1..=8 {
                     let label = fs::read_to_string(p.join(format!("temp{i}_label"))).unwrap_or_default();
                     let l = label.trim();
-                    if l.contains("Package") || l == "Tctl" || l == "Tdie" {
-                        if let Some(v) = read_milli_c(&p, i) {
+                    if (l.contains("Package") || l == "Tctl" || l == "Tdie")
+                        && let Some(v) = read_milli_c(&p, i) {
                             return Some(v);
                         }
-                    }
                 }
                 if let Some(v) = read_milli_c(&p, 1) {
                     return Some(v);
@@ -254,14 +252,12 @@ fn read_cpu_freq() -> Option<f32> {
     let info = fs::read_to_string("/proc/cpuinfo").ok()?;
     let (mut sum, mut n) = (0.0_f32, 0u32);
     for line in info.lines() {
-        if line.starts_with("cpu MHz") {
-            if let Some((_, v)) = line.split_once(':') {
-                if let Ok(f) = v.trim().parse::<f32>() {
+        if line.starts_with("cpu MHz")
+            && let Some((_, v)) = line.split_once(':')
+                && let Ok(f) = v.trim().parse::<f32>() {
                     sum += f;
                     n += 1;
                 }
-            }
-        }
     }
     (n > 0).then(|| sum / n as f32)
 }
@@ -331,4 +327,28 @@ fn read_loadavg() -> ([f32; 3], u32, u32) {
         .map(|(r, t)| (r.parse().unwrap_or(0), t.parse().unwrap_or(0)))
         .unwrap_or((0, 0));
     (load, running, total)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cpu_times_parse_idle_and_total() {
+        // user nice system idle iowait irq softirq steal
+        let t = CpuTimes::parse("10 0 5 80 5 0 0 0").unwrap();
+        assert_eq!(t.idle, 85); // idle + iowait
+        assert_eq!(t.total, 100); // sum of all
+        assert!(CpuTimes::parse("1 2 3").is_none()); // need >= 4 fields
+    }
+
+    #[test]
+    fn cpu_usage_delta() {
+        let a = CpuTimes::parse("10 0 5 80 5 0 0 0").unwrap(); // idle 85, total 100
+        let b = CpuTimes::parse("20 0 10 80 10 0 0 0").unwrap(); // idle 90, total 120
+        // busy delta = (120-100) - (90-85) = 20 - 5 = 15 over 20 -> 75%
+        assert!((b.usage_since(&a) - 75.0).abs() < 0.01);
+        // no progress -> 0%
+        assert_eq!(a.usage_since(&a), 0.0);
+    }
 }

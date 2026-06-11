@@ -39,7 +39,7 @@ impl Collector for NetCollector {
     }
 
     fn interval(&self) -> Duration {
-        Duration::from_millis(1000)
+        super::sample_interval()
     }
 
     fn sample(&mut self) -> anyhow::Result<Vec<NetSnapshot>> {
@@ -50,22 +50,12 @@ impl Collector for NetCollector {
 
         let mut out = Vec::new();
         for line in content.lines().skip(2) {
-            let Some((iface, rest)) = line.split_once(':') else {
+            let Some((iface, rx, tx)) = parse_netdev_line(line) else {
                 continue;
             };
-            let iface = iface.trim().to_string();
             if self.skip_loopback && iface == "lo" {
                 continue;
             }
-            let cols: Vec<u64> = rest
-                .split_whitespace()
-                .map(|v| v.parse().unwrap_or(0))
-                .collect();
-            if cols.len() < 9 {
-                continue;
-            }
-            let rx = cols[0]; // receive bytes
-            let tx = cols[8]; // transmit bytes
 
             let prev = self.prev.entry(iface.clone()).or_default();
             let (rx_bps, tx_bps) = match dt {
@@ -109,5 +99,37 @@ impl Collector for NetCollector {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         Ok(out)
+    }
+}
+
+/// Pure parse of a `/proc/net/dev` data line into `(iface, rx_bytes, tx_bytes)`.
+/// Per-iface columns after the colon: 0 rx_bytes … 8 tx_bytes.
+fn parse_netdev_line(line: &str) -> Option<(String, u64, u64)> {
+    let (iface, rest) = line.split_once(':')?;
+    let cols: Vec<u64> = rest.split_whitespace().map(|v| v.parse().unwrap_or(0)).collect();
+    if cols.len() < 9 {
+        return None;
+    }
+    Some((iface.trim().to_string(), cols[0], cols[8]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn netdev_line_rx_tx_offsets() {
+        // iface: rx_bytes rx_pkts errs drop fifo frame compressed multicast tx_bytes ...
+        let line = "  eth0: 12345 100 0 0 0 0 0 0 67890 200 0 0 0 0 0 0";
+        let (iface, rx, tx) = parse_netdev_line(line).unwrap();
+        assert_eq!(iface, "eth0");
+        assert_eq!(rx, 12345);
+        assert_eq!(tx, 67890);
+    }
+
+    #[test]
+    fn netdev_rejects_header_and_short() {
+        assert!(parse_netdev_line("Inter-|   Receive").is_none());
+        assert!(parse_netdev_line("lo: 1 2 3").is_none());
     }
 }

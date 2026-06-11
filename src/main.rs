@@ -9,6 +9,19 @@ use collector::spawn;
 use model::SharedState;
 
 fn main() -> std::io::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    // `--log <file>`: record collector errors for diagnosing odd hardware.
+    if let Some(i) = args.iter().position(|a| a == "--log")
+        && let Some(path) = args.get(i + 1)
+            && let Err(e) = collector::init_logger(path) {
+                eprintln!("mon: cannot open log {path}: {e}");
+            }
+    // `--interval <ms>`: base sampling interval (default 1000).
+    if let Some(i) = args.iter().position(|a| a == "--interval")
+        && let Some(ms) = args.get(i + 1).and_then(|v| v.parse::<u64>().ok()) {
+            collector::set_interval_ms(ms);
+        }
+
     let state = Arc::new(SharedState::default());
     let shutdown = Arc::new(AtomicBool::new(false));
 
@@ -83,7 +96,11 @@ fn print_probe(state: &SharedState) {
                     "{label}[{}] {}{}  busy={:.0}%  vram={}/{} MB  temp={}  power={}  sclk={}  fan={}",
                     g.index,
                     g.name,
-                    if g.suspended { " [suspended]" } else { "" },
+                    match (&g.note, g.suspended) {
+                        (Some(n), _) => format!(" [{n}]"),
+                        (None, true) => " [suspended]".into(),
+                        (None, false) => String::new(),
+                    },
                     g.busy_pct,
                     g.mem_used / 1048576,
                     g.mem_total / 1048576,

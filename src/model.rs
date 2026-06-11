@@ -127,6 +127,9 @@ pub struct GpuSnapshot {
     /// AMD only: the GPU is runtime-suspended (D3cold), so SMU telemetry
     /// (utilization/temp/power/clock) is unavailable until it resumes.
     pub suspended: bool,
+    /// Optional diagnostic note shown on the card (e.g. an unsupported
+    /// gpu_metrics revision), so missing telemetry is explained, not silent.
+    pub note: Option<String>,
 }
 
 #[derive(Clone, Debug)]

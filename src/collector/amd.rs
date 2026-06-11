@@ -38,7 +38,7 @@ impl Collector for AmdCollector {
     }
 
     fn interval(&self) -> Duration {
-        Duration::from_millis(1000)
+        super::sample_interval()
     }
 
     fn sample(&mut self) -> anyhow::Result<Vec<GpuSnapshot>> {
@@ -50,7 +50,8 @@ impl Collector for AmdCollector {
             // (e.g. RDNA4 / Navi 48) the legacy gpu_busy_percent and hwmon
             // sensors return EBUSY, but gpu_metrics is populated. Fall back to
             // the legacy sysfs nodes (which APUs expose) when metrics are absent.
-            let metrics = read_gpu_metrics(&dev);
+            let metrics_res = read_gpu_metrics(&dev);
+            let metrics = metrics_res.as_ref().ok().copied();
 
             let mem_used = read_u64(dev.join("mem_info_vram_used")).unwrap_or(0);
             let mem_total = read_u64(dev.join("mem_info_vram_total")).unwrap_or(0);
@@ -84,6 +85,15 @@ impl Collector for AmdCollector {
             let suspended = fs::read_to_string(dev.join("power/runtime_status"))
                 .map(|s| s.trim() == "suspended")
                 .unwrap_or(false);
+            // Explain missing telemetry from an undecodable metrics revision.
+            let note = match metrics_res {
+                Err(GpuMetricsErr::Unsupported { format, content })
+                    if temp_c.is_none() && power_w.is_none() && !suspended =>
+                {
+                    Some(format!("gpu_metrics v{format}.{content} unsupported"))
+                }
+                _ => None,
+            };
 
             let h = self.hist.entry(key).or_default();
             h.util.push(busy_pct as f64);
@@ -113,6 +123,7 @@ impl Collector for AmdCollector {
                 pcie_tx_bps: None,
                 pcie_width: m.and_then(|m| m.pcie_width),
                 suspended,
+                note,
             });
         }
         Ok(out)
@@ -180,6 +191,7 @@ fn read_hwmon(dev: &Path) -> (Option<f32>, Option<f32>, Option<Fan>) {
 }
 
 /// Selected fields decoded from the binary `gpu_metrics` sysfs node.
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct GpuMetrics {
     gfx_activity: f32,
     temp_c: Option<f32>,
@@ -190,35 +202,46 @@ struct GpuMetrics {
     pcie_width: Option<u16>,
 }
 
-/// Decode the `gpu_metrics_v1_x` table (discrete GPUs). The leading
-/// header + temperature + activity + power + clock + fan offsets are stable
-/// across content revisions 1..=3; APU tables (format_revision 2) and unknown
-/// revisions are rejected so the caller falls back to legacy sysfs nodes.
-///
-/// v1_3 layout (little-endian, offsets from start):
-///   0  u16 structure_size, 2 u8 format_rev, 3 u8 content_rev
-///   4  u16 temperature_edge, 6 hotspot, 8 mem, 10 vrgfx, 12 vrsoc, 14 vrmem
-///   16 u16 average_gfx_activity, 18 umc, 20 mm
-///   22 u16 average_socket_power
-///   40 u16 average_gfxclk_frequency ... 44 average_uclk_frequency
-///   54 u16 current_gfxclk, 58 current_uclk
-///   72 u16 current_fan_speed
-fn read_gpu_metrics(dev: &Path) -> Option<GpuMetrics> {
+/// Why a `gpu_metrics` read produced no usable data (surfaced as status).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpuMetricsErr {
+    /// Node missing or read failed (e.g. EBUSY while runtime-suspended).
+    Io,
+    TooShort,
+    /// A revision we don't decode (e.g. APU v2_x, or newer v1_4/v1_5).
+    Unsupported { format: u8, content: u8 },
+    /// Table present but all-zero (not yet populated).
+    Empty,
+}
+
+fn read_gpu_metrics(dev: &Path) -> Result<GpuMetrics, GpuMetricsErr> {
     // Must be read with a single read() syscall: read_to_end would issue a
     // second read that re-triggers the SMU and returns EBUSY, failing the whole
     // call. Read once into a fixed buffer instead.
     use std::io::Read;
-    let mut f = fs::File::open(dev.join("gpu_metrics")).ok()?;
+    let mut f = fs::File::open(dev.join("gpu_metrics")).map_err(|_| GpuMetricsErr::Io)?;
     let mut buf = [0u8; 256];
-    let n = f.read(&mut buf).ok()?;
-    let b = &buf[..n];
+    let n = f.read(&mut buf).map_err(|_| GpuMetricsErr::Io)?;
+    parse_gpu_metrics(&buf[..n])
+}
+
+/// Pure decoder for the binary `gpu_metrics_v1_x` table (discrete GPUs).
+///
+/// v1_3 layout (little-endian): 0 u16 structure_size, 2/3 u8 format/content rev,
+/// 4 temperature_edge, 6 hotspot, 16 average_gfx_activity, 22 average_socket_power,
+/// 40 average_gfxclk, 54 current_gfxclk, 58 current_uclk, 72 fan, 74 pcie_link_width.
+/// Offsets are stable for content revisions 1..=3; other revisions are rejected.
+fn parse_gpu_metrics(b: &[u8]) -> Result<GpuMetrics, GpuMetricsErr> {
     if b.len() < 76 {
-        return None;
+        return Err(GpuMetricsErr::TooShort);
     }
     let format_rev = b[2];
     let content_rev = b[3];
     if format_rev != 1 || !(1..=3).contains(&content_rev) {
-        return None;
+        return Err(GpuMetricsErr::Unsupported {
+            format: format_rev,
+            content: content_rev,
+        });
     }
     let u16le = |o: usize| -> u16 { u16::from_le_bytes([b[o], b[o + 1]]) };
 
@@ -234,13 +257,13 @@ fn read_gpu_metrics(dev: &Path) -> Option<GpuMetrics> {
 
     // All-zero readings mean the table isn't populated; let the caller fall back.
     if temp_edge == 0 && temp_hotspot == 0 && power == 0 && fan == 0 && gfx == 0 {
-        return None;
+        return Err(GpuMetricsErr::Empty);
     }
 
     let temp = if temp_hotspot > 0 { temp_hotspot } else { temp_edge };
     let sclk = if cur_gfxclk > 0 { cur_gfxclk } else { avg_gfxclk };
 
-    Some(GpuMetrics {
+    Ok(GpuMetrics {
         gfx_activity: gfx as f32,
         temp_c: (temp > 0).then_some(temp as f32),
         power_w: (power > 0).then_some(power as f32),
@@ -253,11 +276,92 @@ fn read_gpu_metrics(dev: &Path) -> Option<GpuMetrics> {
 
 /// Parse the current frequency (the line ending with `*`) from a `pp_dpm_*` file.
 fn read_current_clock(path: PathBuf) -> Option<u32> {
-    let content = fs::read_to_string(path).ok()?;
+    parse_current_clock(&fs::read_to_string(path).ok()?)
+}
+
+/// Pure: extract the MHz value from the `*`-marked line of a `pp_dpm_*` table.
+fn parse_current_clock(content: &str) -> Option<u32> {
     let line = content.lines().find(|l| l.trim_end().ends_with('*'))?;
     // e.g. "1: 400Mhz *"
-    let mhz = line
-        .split_whitespace()
-        .find_map(|tok| tok.to_lowercase().strip_suffix("mhz").map(str::to_string))?;
-    mhz.parse().ok()
+    line.split_whitespace()
+        .find_map(|tok| tok.to_lowercase().strip_suffix("mhz").map(str::to_string))?
+        .parse()
+        .ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a synthetic gpu_metrics v1_3 buffer with known field values.
+    fn metrics_buf() -> [u8; 120] {
+        let mut b = [0u8; 120];
+        b[2] = 1; // format_revision
+        b[3] = 3; // content_revision
+        for (off, v) in [
+            (0u16, 120u16),  // structure_size
+            (4, 39),         // temperature_edge
+            (6, 40),         // temperature_hotspot
+            (16, 25),        // average_gfx_activity
+            (22, 12),        // average_socket_power
+            (40, 2000),      // average_gfxclk
+            (54, 2500),      // current_gfxclk
+            (58, 96),        // current_uclk
+            (72, 890),       // current_fan_speed
+            (74, 16),        // pcie_link_width
+        ] {
+            let o = off as usize;
+            b[o..o + 2].copy_from_slice(&v.to_le_bytes());
+        }
+        b
+    }
+
+    #[test]
+    fn gpu_metrics_v1_3_decodes_fields() {
+        let m = parse_gpu_metrics(&metrics_buf()).expect("should decode");
+        assert_eq!(m.gfx_activity, 25.0);
+        assert_eq!(m.temp_c, Some(40.0)); // hotspot preferred over edge
+        assert_eq!(m.power_w, Some(12.0));
+        assert_eq!(m.sclk_mhz, Some(2500)); // current preferred over average
+        assert_eq!(m.mclk_mhz, Some(96));
+        assert_eq!(m.fan_rpm, Some(890));
+        assert_eq!(m.pcie_width, Some(16));
+    }
+
+    #[test]
+    fn gpu_metrics_falls_back_to_edge_and_avg_clk() {
+        let mut b = metrics_buf();
+        b[6..8].copy_from_slice(&0u16.to_le_bytes()); // no hotspot
+        b[54..56].copy_from_slice(&0u16.to_le_bytes()); // no current gfxclk
+        let m = parse_gpu_metrics(&b).unwrap();
+        assert_eq!(m.temp_c, Some(39.0)); // edge
+        assert_eq!(m.sclk_mhz, Some(2000)); // average
+    }
+
+    #[test]
+    fn gpu_metrics_rejects_unsupported_and_empty() {
+        let mut b = metrics_buf();
+        b[3] = 4; // content_revision 4 (v1_4)
+        assert_eq!(
+            parse_gpu_metrics(&b),
+            Err(GpuMetricsErr::Unsupported { format: 1, content: 4 })
+        );
+
+        let mut apu = metrics_buf();
+        apu[2] = 2; // format_revision 2 (APU)
+        assert!(matches!(parse_gpu_metrics(&apu), Err(GpuMetricsErr::Unsupported { .. })));
+
+        let mut empty = [0u8; 120];
+        empty[2] = 1; // valid v1_3 header but all-zero metrics
+        empty[3] = 3;
+        assert_eq!(parse_gpu_metrics(&empty), Err(GpuMetricsErr::Empty));
+        assert_eq!(parse_gpu_metrics(&[0u8; 10]), Err(GpuMetricsErr::TooShort));
+    }
+
+    #[test]
+    fn current_clock_picks_starred_line() {
+        let table = "0: 200Mhz \n1: 400Mhz *\n2: 2000Mhz ";
+        assert_eq!(parse_current_clock(table), Some(400));
+        assert_eq!(parse_current_clock("0: 200Mhz \n1: 400Mhz "), None);
+    }
 }
