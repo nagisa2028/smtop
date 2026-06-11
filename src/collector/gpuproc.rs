@@ -217,12 +217,25 @@ fn collect_amdgpu(
             _ => 0.0,
         };
         indices.sort_unstable();
-        let label: String = indices.iter().map(|i| format!("A{i}")).collect();
         let e = out.entry(pid).or_default();
         e.vram += vram;
         e.util_pct += util;
-        e.label.push_str(&label);
+        for i in &indices {
+            add_gpu_label(e, &format!("A{i}"));
+        }
     }
+}
+
+/// Append a GPU token (e.g. "N0", "A1") to a process's comma-separated label,
+/// skipping duplicates.
+fn add_gpu_label(e: &mut GpuProcUse, token: &str) {
+    if e.label.split(',').any(|t| t == token) {
+        return;
+    }
+    if !e.label.is_empty() {
+        e.label.push(',');
+    }
+    e.label.push_str(token);
 }
 
 #[cfg(feature = "nvidia")]
@@ -248,9 +261,7 @@ fn collect_nvidia(nvml: &Nvml, out: &mut HashMap<i32, GpuProcUse>) {
             };
             let e = out.entry(p.pid as i32).or_default();
             e.vram += mem;
-            if !e.label.contains(&label) {
-                e.label.push_str(&label);
-            }
+            add_gpu_label(e, &label);
         }
 
         // Utilization (best-effort: unsupported / no samples -> skipped).
