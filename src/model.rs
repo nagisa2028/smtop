@@ -4,7 +4,7 @@
 //! history-bearing snapshot into `SharedState` via `ArcSwap` (lock-free). The UI
 //! renders whatever is latest at its own frame rate, decoupled from collection.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use arc_swap::ArcSwapOption;
 
@@ -183,6 +183,18 @@ pub struct ProcInfo {
     pub io_ok: bool,
 }
 
+/// Per-process GPU usage, aggregated across the GPUs a process touches.
+#[derive(Clone, Debug, Default)]
+pub struct GpuProcUse {
+    /// VRAM used by the process (bytes).
+    pub vram: u64,
+    /// GPU utilization attributed to the process (percent; NVIDIA SM% / AMD
+    /// engine busy). 0 when unavailable.
+    pub util_pct: f32,
+    /// Which GPU(s), e.g. "N0" (NVIDIA 0) or "A0" (AMD 0).
+    pub label: String,
+}
+
 /// Lock-free shared state: one `ArcSwapOption` slot per collector source.
 #[derive(Default)]
 pub struct SharedState {
@@ -193,4 +205,6 @@ pub struct SharedState {
     pub disk: ArcSwapOption<Vec<DiskSnapshot>>,
     pub fs: ArcSwapOption<Vec<FsSnapshot>>,
     pub procs: ArcSwapOption<Vec<ProcInfo>>,
+    /// pid -> aggregated GPU usage (NVML + amdgpu fdinfo).
+    pub gpu_procs: ArcSwapOption<HashMap<i32, GpuProcUse>>,
 }

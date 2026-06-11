@@ -70,6 +70,12 @@ fn main() -> std::io::Result<()> {
             s.procs.store(Some(Arc::new(o)))
         });
     }
+    {
+        let s = state.clone();
+        spawn(collector::gpuproc::GpuProcCollector::new(), shutdown.clone(), move |o| {
+            s.gpu_procs.store(Some(Arc::new(o)))
+        });
+    }
 
     // Headless probe: dump one sample and exit (useful over SSH, no TTY needed).
     if std::env::args().any(|a| a == "--probe") {
@@ -148,6 +154,14 @@ fn print_probe(state: &SharedState) {
     if let Some(fs) = state.fs.load_full() {
         for f in fs.iter().take(6) {
             println!("FS   {}  {}/{} GB", f.mount, f.used / 1073741824, f.total / 1073741824);
+        }
+    }
+    if let Some(gp) = state.gpu_procs.load_full() {
+        let mut v: Vec<_> = gp.iter().collect();
+        v.sort_by_key(|(_, g)| std::cmp::Reverse(g.vram));
+        println!("GPU-PROCS {} using GPU; top by VRAM:", gp.len());
+        for (pid, g) in v.iter().take(5) {
+            println!("  {:>7} [{}] {:.0}% util  {} MB VRAM", pid, g.label, g.util_pct, g.vram / 1048576);
         }
     }
     if let Some(procs) = state.procs.load_full() {

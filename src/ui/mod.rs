@@ -33,6 +33,8 @@ enum ProcSort {
     Mem,
     DiskRead,
     DiskWrite,
+    GpuPct,
+    GpuVram,
     Pid,
 }
 
@@ -42,7 +44,9 @@ impl ProcSort {
             ProcSort::Cpu => ProcSort::Mem,
             ProcSort::Mem => ProcSort::DiskRead,
             ProcSort::DiskRead => ProcSort::DiskWrite,
-            ProcSort::DiskWrite => ProcSort::Pid,
+            ProcSort::DiskWrite => ProcSort::GpuPct,
+            ProcSort::GpuPct => ProcSort::GpuVram,
+            ProcSort::GpuVram => ProcSort::Pid,
             ProcSort::Pid => ProcSort::Cpu,
         }
     }
@@ -52,6 +56,8 @@ impl ProcSort {
             ProcSort::Mem => "MEM",
             ProcSort::DiskRead => "DISK R",
             ProcSort::DiskWrite => "DISK W",
+            ProcSort::GpuPct => "GPU",
+            ProcSort::GpuVram => "VRAM",
             ProcSort::Pid => "PID",
         }
     }
@@ -118,6 +124,8 @@ fn run_loop(terminal: &mut DefaultTerminal, state: &SharedState) -> io::Result<(
                         KeyCode::Char('m') if in_procs => view.proc_sort = ProcSort::Mem,
                         KeyCode::Char('d') if in_procs => view.proc_sort = ProcSort::DiskRead,
                         KeyCode::Char('D') if in_procs => view.proc_sort = ProcSort::DiskWrite,
+                        KeyCode::Char('g') if in_procs => view.proc_sort = ProcSort::GpuPct,
+                        KeyCode::Char('G') if in_procs => view.proc_sort = ProcSort::GpuVram,
                         KeyCode::Char('p') if in_procs => view.proc_sort = ProcSort::Pid,
                         KeyCode::Down | KeyCode::Char('j') if in_procs => {
                             view.proc_scroll += 1;
@@ -369,7 +377,7 @@ fn render_processes(frame: &mut Frame, area: Rect, state: &SharedState, view: &V
     let count = procs.as_ref().map_or(0, |p| p.len());
     let block = Block::bordered().title(
         format!(
-            " Processes ({count})   sort:{}   keys: s cycle · c/m/d/D/p · ↑↓ scroll ",
+            " Processes ({count})   sort:{}   keys: s cycle · c/m/d/D/g/G/p · ↑↓ scroll ",
             view.proc_sort.label()
         )
         .bold(),
@@ -381,17 +389,25 @@ fn render_processes(frame: &mut Frame, area: Rect, state: &SharedState, view: &V
         frame.render_widget(Paragraph::new("collecting…".dim()), inner);
         return;
     };
+    // Per-process GPU usage, joined by pid.
+    let gmap = state.gpu_procs.load_full();
+    let gpu_of = |pid: i32| gmap.as_ref().and_then(|m| m.get(&pid));
+    let gpu_util = |pid: i32| gpu_of(pid).map_or(0.0, |g| g.util_pct);
+    let gpu_vram = |pid: i32| gpu_of(pid).map_or(0, |g| g.vram);
+
     let mut list: Vec<ProcInfo> = procs.to_vec();
     match view.proc_sort {
         ProcSort::Cpu => list.sort_by(|a, b| b.cpu_pct.total_cmp(&a.cpu_pct)),
         ProcSort::Mem => list.sort_by_key(|p| std::cmp::Reverse(p.rss)),
         ProcSort::DiskRead => list.sort_by(|a, b| b.disk_read_bps.total_cmp(&a.disk_read_bps)),
         ProcSort::DiskWrite => list.sort_by(|a, b| b.disk_write_bps.total_cmp(&a.disk_write_bps)),
+        ProcSort::GpuPct => list.sort_by(|a, b| gpu_util(b.pid).total_cmp(&gpu_util(a.pid))),
+        ProcSort::GpuVram => list.sort_by_key(|p| std::cmp::Reverse(gpu_vram(p.pid))),
         ProcSort::Pid => list.sort_by_key(|p| p.pid),
     }
 
-    // Fixed columns: PID(7) CPU%(5) MEM(9) DISK_R(8) DISK_W(8) S(1) + COMMAND.
-    let cmd_w = (inner.width as usize).saturating_sub(44).max(4);
+    // Fixed columns: PID(7) CPU(5) MEM(9) DISK_R(8) DISK_W(8) GPU(9) VRAM(8) S(1).
+    let cmd_w = (inner.width as usize).saturating_sub(63).max(4);
     let base = Style::new().add_modifier(Modifier::REVERSED);
     let active = Style::new().fg(Color::Yellow).add_modifier(Modifier::REVERSED | Modifier::BOLD);
     let col = |text: String, this: ProcSort| {
@@ -408,6 +424,10 @@ fn render_processes(frame: &mut Frame, area: Rect, state: &SharedState, view: &V
         col(format!("{:>7}{}", "DISK R", mark(ProcSort::DiskRead)), ProcSort::DiskRead),
         Span::styled(" ", base),
         col(format!("{:>7}{}", "DISK W", mark(ProcSort::DiskWrite)), ProcSort::DiskWrite),
+        Span::styled(" ", base),
+        col(format!("{:>8}{}", "GPU", mark(ProcSort::GpuPct)), ProcSort::GpuPct),
+        Span::styled(" ", base),
+        col(format!("{:>7}{}", "VRAM", mark(ProcSort::GpuVram)), ProcSort::GpuVram),
         Span::styled(" S ", base),
         Span::styled(format!("{:<cmd_w$}", "COMMAND"), base),
     ]);
@@ -430,6 +450,17 @@ fn render_processes(frame: &mut Frame, area: Rect, state: &SharedState, view: &V
     let mut lines = vec![header];
     for p in list.iter().skip(scroll).take(visible) {
         let name: String = p.name.chars().take(cmd_w).collect();
+        // GPU cell: "<label> <util>%" (e.g. "N0 45%"); blank if not using a GPU.
+        let g = gpu_of(p.pid);
+        let gpu_text = match g {
+            Some(g) if !g.label.is_empty() => format!("{} {:.0}%", g.label, g.util_pct),
+            _ => String::new(),
+        };
+        let gpu_util_val = g.map_or(0.0, |g| g.util_pct);
+        let vram_text = match g {
+            Some(g) if g.vram > 0 => fmt_bytes(g.vram),
+            _ => String::new(),
+        };
         lines.push(Line::from(vec![
             Span::raw(format!("{:>7} ", p.pid)),
             Span::styled(
@@ -439,6 +470,8 @@ fn render_processes(frame: &mut Frame, area: Rect, state: &SharedState, view: &V
             Span::raw(format!("{:>9} ", fmt_bytes(p.rss))),
             disk_cell(p.disk_read_bps, p.io_ok, Color::Cyan),
             disk_cell(p.disk_write_bps, p.io_ok, Color::Magenta),
+            Span::styled(format!("{gpu_text:>9} "), Style::new().fg(usage_color(gpu_util_val.min(100.0)))),
+            Span::styled(format!("{vram_text:>8} "), Style::new().fg(Color::Blue)),
             Span::styled(format!("{} ", p.state), proc_state_style(p.state)),
             Span::styled(name, Style::new().add_modifier(Modifier::DIM)),
         ]));
@@ -889,9 +922,10 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{CoreGroup, History, ProcInfo, SharedState};
+    use crate::model::{CoreGroup, GpuProcUse, History, ProcInfo, SharedState};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use std::collections::HashMap;
 
     fn full_to_text(state: &SharedState, view: &View, w: u16, h: u16) -> String {
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
@@ -914,6 +948,10 @@ mod tests {
             ProcInfo { pid: 1, name: "AAA_high_cpu".into(), cpu_pct: 99.0, rss: 10 << 20, state: 'R', disk_read_bps: 0.0, disk_write_bps: 7e6, io_ok: true },
             ProcInfo { pid: 2, name: "BBB_high_mem".into(), cpu_pct: 1.0, rss: 900 << 20, state: 'S', disk_read_bps: 5e6, disk_write_bps: 0.0, io_ok: true },
         ])));
+        // pid 2 hogs GPU (VRAM + util); pid 1 uses none.
+        state.gpu_procs.store(Some(std::sync::Arc::new(HashMap::from([
+            (2, GpuProcUse { vram: 2 << 30, util_pct: 80.0, label: "N0".into() }),
+        ]))));
         let pos = |t: &str, needle: &str| t.lines().position(|l| l.contains(needle));
 
         let mut view = View { tab: Tab::Processes, paused: false, proc_scroll: 0, proc_sort: ProcSort::Cpu };
@@ -936,6 +974,16 @@ mod tests {
         view.proc_sort = ProcSort::DiskWrite;
         let t = full_to_text(&state, &view, 90, 20);
         assert!(pos(&t, "AAA_high_cpu") < pos(&t, "BBB_high_mem"), "DISK W sort order wrong");
+
+        // pid 2 uses the GPU → first under GPU% and VRAM sorts.
+        view.proc_sort = ProcSort::GpuPct;
+        let t = full_to_text(&state, &view, 110, 20);
+        assert!(pos(&t, "BBB_high_mem") < pos(&t, "AAA_high_cpu"), "GPU% sort order wrong");
+        assert!(t.contains("N0 80%"), "GPU cell missing");
+
+        view.proc_sort = ProcSort::GpuVram;
+        let t = full_to_text(&state, &view, 110, 20);
+        assert!(pos(&t, "BBB_high_mem") < pos(&t, "AAA_high_cpu"), "VRAM sort order wrong");
     }
 
     fn synth(core_groups: Vec<CoreGroup>, ncpu: usize) -> CpuSnapshot {
