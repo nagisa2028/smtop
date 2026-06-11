@@ -174,6 +174,9 @@ pub struct ProcInfo {
     /// Resident set size in bytes.
     pub rss: u64,
     pub state: char,
+    /// Disk read/write rate in bytes/s (0 if /proc/<pid>/io is inaccessible).
+    pub disk_read_bps: f64,
+    pub disk_write_bps: f64,
 }
 
 /// Lock-free shared state: one `ArcSwapOption` slot per collector source.

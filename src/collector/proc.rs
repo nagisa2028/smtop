@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::Collector;
 use crate::model::ProcInfo;
@@ -11,12 +11,20 @@ use crate::model::ProcInfo;
 /// Linux x86_64 systems.
 const PAGE_SIZE: u64 = 4096;
 
+/// Per-pid carry-over needed for rate/usage deltas.
+#[derive(Clone, Copy, Default)]
+struct Prev {
+    jiffies: u64,
+    read_bytes: u64,
+    write_bytes: u64,
+}
+
 pub struct ProcessCollector {
-    /// pid -> previous (utime + stime) jiffies.
-    prev: HashMap<i32, u64>,
+    prev: HashMap<i32, Prev>,
     /// Previous total CPU jiffies (all cores) for the % denominator.
     prev_total: u64,
     ncpu: f64,
+    last: Option<Instant>,
 }
 
 impl ProcessCollector {
@@ -25,6 +33,7 @@ impl ProcessCollector {
             prev: HashMap::new(),
             prev_total: 0,
             ncpu: count_cpus().max(1) as f64,
+            last: None,
         }
     }
 }
@@ -43,9 +52,11 @@ impl Collector for ProcessCollector {
     fn sample(&mut self) -> anyhow::Result<Vec<ProcInfo>> {
         let total = read_total_jiffies();
         let total_delta = total.saturating_sub(self.prev_total);
+        let now = Instant::now();
+        let dt = self.last.map(|l| now.duration_since(l).as_secs_f64());
 
         let mut out = Vec::new();
-        let mut cur: HashMap<i32, u64> = HashMap::new();
+        let mut cur: HashMap<i32, Prev> = HashMap::new();
 
         for entry in fs::read_dir("/proc")?.flatten() {
             let fname = entry.file_name();
@@ -55,15 +66,24 @@ impl Collector for ProcessCollector {
             let Some((comm, state, jiffies)) = read_proc_stat(pid) else {
                 continue;
             };
-            cur.insert(pid, jiffies);
+            let (read_bytes, write_bytes) = read_proc_io(pid);
+            let prev = self.prev.get(&pid).copied();
+            cur.insert(pid, Prev { jiffies, read_bytes, write_bytes });
 
             // CPU% normalized so one fully-busy core reads ~100%.
-            let cpu_pct = match self.prev.get(&pid) {
-                Some(&prev_j) if total_delta > 0 => {
-                    let dj = jiffies.saturating_sub(prev_j);
+            let cpu_pct = match prev {
+                Some(p) if total_delta > 0 => {
+                    let dj = jiffies.saturating_sub(p.jiffies);
                     (dj as f64 / total_delta as f64 * self.ncpu * 100.0) as f32
                 }
                 _ => 0.0,
+            };
+            let (disk_read_bps, disk_write_bps) = match (prev, dt) {
+                (Some(p), Some(dt)) if dt > 0.0 => (
+                    read_bytes.saturating_sub(p.read_bytes) as f64 / dt,
+                    write_bytes.saturating_sub(p.write_bytes) as f64 / dt,
+                ),
+                _ => (0.0, 0.0),
             };
 
             let name = read_cmdline(pid).unwrap_or(comm);
@@ -73,13 +93,34 @@ impl Collector for ProcessCollector {
                 cpu_pct,
                 rss: read_rss(pid),
                 state,
+                disk_read_bps,
+                disk_write_bps,
             });
         }
 
         self.prev = cur;
         self.prev_total = total;
+        self.last = Some(now);
         Ok(out)
     }
+}
+
+/// Disk bytes read/written from `/proc/<pid>/io` (read_bytes, write_bytes).
+/// Returns `(0, 0)` when inaccessible (needs ownership or CAP_SYS_PTRACE).
+fn read_proc_io(pid: i32) -> (u64, u64) {
+    let Ok(content) = fs::read_to_string(format!("/proc/{pid}/io")) else {
+        return (0, 0);
+    };
+    let mut read = 0;
+    let mut write = 0;
+    for line in content.lines() {
+        if let Some(v) = line.strip_prefix("read_bytes:") {
+            read = v.trim().parse().unwrap_or(0);
+        } else if let Some(v) = line.strip_prefix("write_bytes:") {
+            write = v.trim().parse().unwrap_or(0);
+        }
+    }
+    (read, write)
 }
 
 fn count_cpus() -> usize {

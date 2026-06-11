@@ -31,6 +31,7 @@ enum Tab {
 enum ProcSort {
     Cpu,
     Mem,
+    Disk,
     Pid,
 }
 
@@ -38,7 +39,8 @@ impl ProcSort {
     fn next(self) -> Self {
         match self {
             ProcSort::Cpu => ProcSort::Mem,
-            ProcSort::Mem => ProcSort::Pid,
+            ProcSort::Mem => ProcSort::Disk,
+            ProcSort::Disk => ProcSort::Pid,
             ProcSort::Pid => ProcSort::Cpu,
         }
     }
@@ -46,6 +48,7 @@ impl ProcSort {
         match self {
             ProcSort::Cpu => "CPU",
             ProcSort::Mem => "MEM",
+            ProcSort::Disk => "DISK",
             ProcSort::Pid => "PID",
         }
     }
@@ -110,6 +113,7 @@ fn run_loop(terminal: &mut DefaultTerminal, state: &SharedState) -> io::Result<(
                         KeyCode::Char('s') if in_procs => view.proc_sort = view.proc_sort.next(),
                         KeyCode::Char('c') if in_procs => view.proc_sort = ProcSort::Cpu,
                         KeyCode::Char('m') if in_procs => view.proc_sort = ProcSort::Mem,
+                        KeyCode::Char('d') if in_procs => view.proc_sort = ProcSort::Disk,
                         KeyCode::Char('p') if in_procs => view.proc_sort = ProcSort::Pid,
                         KeyCode::Down | KeyCode::Char('j') if in_procs => {
                             view.proc_scroll += 1;
@@ -361,7 +365,7 @@ fn render_processes(frame: &mut Frame, area: Rect, state: &SharedState, view: &V
     let count = procs.as_ref().map_or(0, |p| p.len());
     let block = Block::bordered().title(
         format!(
-            " Processes ({count})   sort:{}   keys: s cycle · c/m/p · ↑↓ scroll ",
+            " Processes ({count})   sort:{}   keys: s cycle · c/m/d/p · ↑↓ scroll ",
             view.proc_sort.label()
         )
         .bold(),
@@ -377,11 +381,14 @@ fn render_processes(frame: &mut Frame, area: Rect, state: &SharedState, view: &V
     match view.proc_sort {
         ProcSort::Cpu => list.sort_by(|a, b| b.cpu_pct.total_cmp(&a.cpu_pct)),
         ProcSort::Mem => list.sort_by_key(|p| std::cmp::Reverse(p.rss)),
+        ProcSort::Disk => list.sort_by(|a, b| {
+            (b.disk_read_bps + b.disk_write_bps).total_cmp(&(a.disk_read_bps + a.disk_write_bps))
+        }),
         ProcSort::Pid => list.sort_by_key(|p| p.pid),
     }
 
-    let cmd_w = (inner.width as usize).saturating_sub(26).max(4);
-    // Header row with the active sort column marked (▼) and highlighted.
+    // Fixed columns: PID(7) CPU%(5) MEM(9) DISK_R(8) DISK_W(8) S(1) + COMMAND.
+    let cmd_w = (inner.width as usize).saturating_sub(44).max(4);
     let base = Style::new().add_modifier(Modifier::REVERSED);
     let active = Style::new().fg(Color::Yellow).add_modifier(Modifier::REVERSED | Modifier::BOLD);
     let col = |text: String, this: ProcSort| {
@@ -394,6 +401,10 @@ fn render_processes(frame: &mut Frame, area: Rect, state: &SharedState, view: &V
         col(format!("{:>4}{}", "CPU%", mark(ProcSort::Cpu)), ProcSort::Cpu),
         Span::styled(" ", base),
         col(format!("{:>8}{}", "MEM", mark(ProcSort::Mem)), ProcSort::Mem),
+        Span::styled(" ", base),
+        col(format!("{:>7}{}", "DISK R", mark(ProcSort::Disk)), ProcSort::Disk),
+        Span::styled(" ", base),
+        Span::styled(format!("{:>8}", "DISK W"), base),
         Span::styled(" S ", base),
         Span::styled(format!("{:<cmd_w$}", "COMMAND"), base),
     ]);
@@ -401,6 +412,14 @@ fn render_processes(frame: &mut Frame, area: Rect, state: &SharedState, view: &V
     let visible = (inner.height as usize).saturating_sub(1);
     let scroll = view.proc_scroll.min(list.len().saturating_sub(visible));
 
+    // Blank instead of "0B" for idle rows to cut noise.
+    let io = |bps: f64| {
+        if bps >= 1.0 {
+            fmt_bytes(bps as u64)
+        } else {
+            String::new()
+        }
+    };
     let mut lines = vec![header];
     for p in list.iter().skip(scroll).take(visible) {
         let name: String = p.name.chars().take(cmd_w).collect();
@@ -411,6 +430,8 @@ fn render_processes(frame: &mut Frame, area: Rect, state: &SharedState, view: &V
                 Style::new().fg(usage_color(p.cpu_pct.min(100.0))),
             ),
             Span::raw(format!("{:>9} ", fmt_bytes(p.rss))),
+            Span::styled(format!("{:>8} ", io(p.disk_read_bps)), Style::new().fg(Color::Cyan)),
+            Span::styled(format!("{:>8} ", io(p.disk_write_bps)), Style::new().fg(Color::Magenta)),
             Span::styled(format!("{} ", p.state), proc_state_style(p.state)),
             Span::styled(name, Style::new().add_modifier(Modifier::DIM)),
         ]));
@@ -883,8 +904,8 @@ mod tests {
     fn processes_tab_sorts_by_selected_key() {
         let state = SharedState::default();
         state.procs.store(Some(std::sync::Arc::new(vec![
-            ProcInfo { pid: 1, name: "AAA_high_cpu".into(), cpu_pct: 99.0, rss: 10 << 20, state: 'R' },
-            ProcInfo { pid: 2, name: "BBB_high_mem".into(), cpu_pct: 1.0, rss: 900 << 20, state: 'S' },
+            ProcInfo { pid: 1, name: "AAA_high_cpu".into(), cpu_pct: 99.0, rss: 10 << 20, state: 'R', disk_read_bps: 0.0, disk_write_bps: 0.0 },
+            ProcInfo { pid: 2, name: "BBB_high_mem".into(), cpu_pct: 1.0, rss: 900 << 20, state: 'S', disk_read_bps: 5e6, disk_write_bps: 0.0 },
         ])));
         let pos = |t: &str, needle: &str| t.lines().position(|l| l.contains(needle));
 
@@ -899,6 +920,11 @@ mod tests {
         view.proc_sort = ProcSort::Pid;
         let t = full_to_text(&state, &view, 80, 20);
         assert!(pos(&t, "AAA_high_cpu") < pos(&t, "BBB_high_mem"), "PID sort order wrong");
+
+        // BBB has disk read activity, AAA none → BBB first under Disk sort.
+        view.proc_sort = ProcSort::Disk;
+        let t = full_to_text(&state, &view, 90, 20);
+        assert!(pos(&t, "BBB_high_mem") < pos(&t, "AAA_high_cpu"), "DISK sort order wrong");
     }
 
     fn synth(core_groups: Vec<CoreGroup>, ncpu: usize) -> CpuSnapshot {

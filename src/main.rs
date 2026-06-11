@@ -156,12 +156,14 @@ fn print_probe(state: &SharedState) {
         println!("PROCS {} total; top by CPU:", procs.len());
         for p in top.iter().take(5) {
             println!(
-                "  {:>7} {:>5.1}% {:>8} MB {} {}",
+                "  {:>7} {:>5.1}% {:>8} MB  disk r{:.0}/w{:.0} KB/s  {} {}",
                 p.pid,
                 p.cpu_pct,
                 p.rss / 1048576,
+                p.disk_read_bps / 1024.0,
+                p.disk_write_bps / 1024.0,
                 p.state,
-                p.name.chars().take(40).collect::<String>()
+                p.name.chars().take(36).collect::<String>()
             );
         }
     }
