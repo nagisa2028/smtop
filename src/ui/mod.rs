@@ -69,6 +69,8 @@ struct View {
     paused: bool,
     proc_scroll: usize,
     proc_sort: ProcSort,
+    /// Reverse (ascending) the active process sort.
+    proc_rev: bool,
 }
 
 impl Default for View {
@@ -78,7 +80,18 @@ impl Default for View {
             paused: false,
             proc_scroll: 0,
             proc_sort: ProcSort::Cpu,
+            proc_rev: false,
         }
+    }
+}
+
+/// Select a sort column; re-selecting the active one flips the direction.
+fn set_sort(view: &mut View, s: ProcSort) {
+    if view.proc_sort == s {
+        view.proc_rev = !view.proc_rev;
+    } else {
+        view.proc_sort = s;
+        view.proc_rev = false;
     }
 }
 
@@ -119,14 +132,18 @@ fn run_loop(terminal: &mut DefaultTerminal, state: &SharedState) -> io::Result<(
                         }
                         KeyCode::Char('1') => view.tab = Tab::Overview,
                         KeyCode::Char('2') => view.tab = Tab::Processes,
-                        KeyCode::Char('s') if in_procs => view.proc_sort = view.proc_sort.next(),
-                        KeyCode::Char('c') if in_procs => view.proc_sort = ProcSort::Cpu,
-                        KeyCode::Char('m') if in_procs => view.proc_sort = ProcSort::Mem,
-                        KeyCode::Char('d') if in_procs => view.proc_sort = ProcSort::DiskRead,
-                        KeyCode::Char('D') if in_procs => view.proc_sort = ProcSort::DiskWrite,
-                        KeyCode::Char('g') if in_procs => view.proc_sort = ProcSort::GpuPct,
-                        KeyCode::Char('G') if in_procs => view.proc_sort = ProcSort::GpuVram,
-                        KeyCode::Char('p') if in_procs => view.proc_sort = ProcSort::Pid,
+                        KeyCode::Char('s') if in_procs => {
+                            view.proc_sort = view.proc_sort.next();
+                            view.proc_rev = false;
+                        }
+                        KeyCode::Char('r') if in_procs => view.proc_rev = !view.proc_rev,
+                        KeyCode::Char('c') if in_procs => set_sort(&mut view, ProcSort::Cpu),
+                        KeyCode::Char('m') if in_procs => set_sort(&mut view, ProcSort::Mem),
+                        KeyCode::Char('d') if in_procs => set_sort(&mut view, ProcSort::DiskRead),
+                        KeyCode::Char('D') if in_procs => set_sort(&mut view, ProcSort::DiskWrite),
+                        KeyCode::Char('g') if in_procs => set_sort(&mut view, ProcSort::GpuPct),
+                        KeyCode::Char('G') if in_procs => set_sort(&mut view, ProcSort::GpuVram),
+                        KeyCode::Char('p') if in_procs => set_sort(&mut view, ProcSort::Pid),
                         KeyCode::Down | KeyCode::Char('j') if in_procs => {
                             view.proc_scroll += 1;
                         }
@@ -377,8 +394,9 @@ fn render_processes(frame: &mut Frame, area: Rect, state: &SharedState, view: &V
     let count = procs.as_ref().map_or(0, |p| p.len());
     let block = Block::bordered().title(
         format!(
-            " Processes ({count})   sort:{}   keys: s cycle · c/m/d/D/g/G/p · ↑↓ scroll ",
-            view.proc_sort.label()
+            " Processes ({count})   sort:{}{}   keys: s cycle · c/m/d/D/g/G/p · r reverse · ↑↓ ",
+            view.proc_sort.label(),
+            if view.proc_rev { " ▴" } else { " ▾" }
         )
         .bold(),
     );
@@ -405,6 +423,9 @@ fn render_processes(frame: &mut Frame, area: Rect, state: &SharedState, view: &V
         ProcSort::GpuVram => list.sort_by_key(|p| std::cmp::Reverse(gpu_vram(p.pid))),
         ProcSort::Pid => list.sort_by_key(|p| p.pid),
     }
+    if view.proc_rev {
+        list.reverse();
+    }
 
     // Fixed columns: PID(7) CPU(5) MEM(9) DISK_R(8) DISK_W(8) GPU(9) VRAM(8) S(1).
     let cmd_w = (inner.width as usize).saturating_sub(63).max(4);
@@ -413,7 +434,13 @@ fn render_processes(frame: &mut Frame, area: Rect, state: &SharedState, view: &V
     let col = |text: String, this: ProcSort| {
         Span::styled(text, if view.proc_sort == this { active } else { base })
     };
-    let mark = |this: ProcSort| if view.proc_sort == this { '▾' } else { ' ' };
+    let mark = |this: ProcSort| {
+        if view.proc_sort == this {
+            if view.proc_rev { '▴' } else { '▾' }
+        } else {
+            ' '
+        }
+    };
     let header = Line::from(vec![
         col(format!("{:>6}{}", "PID", mark(ProcSort::Pid)), ProcSort::Pid),
         Span::styled(" ", base),
@@ -954,9 +981,15 @@ mod tests {
         ]))));
         let pos = |t: &str, needle: &str| t.lines().position(|l| l.contains(needle));
 
-        let mut view = View { tab: Tab::Processes, paused: false, proc_scroll: 0, proc_sort: ProcSort::Cpu };
+        let mut view = View { tab: Tab::Processes, paused: false, proc_scroll: 0, proc_sort: ProcSort::Cpu, proc_rev: false };
         let t = full_to_text(&state, &view, 80, 20);
         assert!(pos(&t, "AAA_high_cpu") < pos(&t, "BBB_high_mem"), "CPU sort order wrong");
+
+        // Reverse flips the order.
+        view.proc_rev = true;
+        let t = full_to_text(&state, &view, 80, 20);
+        assert!(pos(&t, "BBB_high_mem") < pos(&t, "AAA_high_cpu"), "reverse CPU sort wrong");
+        view.proc_rev = false;
 
         view.proc_sort = ProcSort::Mem;
         let t = full_to_text(&state, &view, 80, 20);
