@@ -367,9 +367,9 @@ fn render_header(frame: &mut Frame, area: Rect, state: &SharedState, view: &View
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
     let hints = if view.tab == Tab::Processes {
-        "Tab:switch  s:sort  ↑↓:scroll  q:quit"
+        "Tab/1/2:tabs  c/m/d/g:sort  r:reverse  ↑↓:scroll  q:quit"
     } else {
-        "Tab:switch  space:pause  q:quit"
+        "Tab/1/2:tabs  space:pause  q:quit"
     };
     frame.render_widget(
         Paragraph::new(hints)
