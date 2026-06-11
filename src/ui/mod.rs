@@ -412,13 +412,17 @@ fn render_processes(frame: &mut Frame, area: Rect, state: &SharedState, view: &V
     let visible = (inner.height as usize).saturating_sub(1);
     let scroll = view.proc_scroll.min(list.len().saturating_sub(visible));
 
-    // Blank instead of "0B" for idle rows to cut noise.
-    let io = |bps: f64| {
-        if bps >= 1.0 {
-            fmt_bytes(bps as u64)
+    // Disk cell: "n/a" (dim) if /proc/<pid>/io is unreadable, blank when idle
+    // (cached/buffered I/O genuinely reads as 0), value otherwise.
+    let disk_cell = |bps: f64, ok: bool, color: Color| {
+        let (text, style) = if !ok {
+            ("n/a".to_string(), Style::new().fg(Color::DarkGray))
+        } else if bps >= 1.0 {
+            (fmt_bytes(bps as u64), Style::new().fg(color))
         } else {
-            String::new()
-        }
+            (String::new(), Style::new())
+        };
+        Span::styled(format!("{text:>8} "), style)
     };
     let mut lines = vec![header];
     for p in list.iter().skip(scroll).take(visible) {
@@ -430,8 +434,8 @@ fn render_processes(frame: &mut Frame, area: Rect, state: &SharedState, view: &V
                 Style::new().fg(usage_color(p.cpu_pct.min(100.0))),
             ),
             Span::raw(format!("{:>9} ", fmt_bytes(p.rss))),
-            Span::styled(format!("{:>8} ", io(p.disk_read_bps)), Style::new().fg(Color::Cyan)),
-            Span::styled(format!("{:>8} ", io(p.disk_write_bps)), Style::new().fg(Color::Magenta)),
+            disk_cell(p.disk_read_bps, p.io_ok, Color::Cyan),
+            disk_cell(p.disk_write_bps, p.io_ok, Color::Magenta),
             Span::styled(format!("{} ", p.state), proc_state_style(p.state)),
             Span::styled(name, Style::new().add_modifier(Modifier::DIM)),
         ]));
@@ -904,8 +908,8 @@ mod tests {
     fn processes_tab_sorts_by_selected_key() {
         let state = SharedState::default();
         state.procs.store(Some(std::sync::Arc::new(vec![
-            ProcInfo { pid: 1, name: "AAA_high_cpu".into(), cpu_pct: 99.0, rss: 10 << 20, state: 'R', disk_read_bps: 0.0, disk_write_bps: 0.0 },
-            ProcInfo { pid: 2, name: "BBB_high_mem".into(), cpu_pct: 1.0, rss: 900 << 20, state: 'S', disk_read_bps: 5e6, disk_write_bps: 0.0 },
+            ProcInfo { pid: 1, name: "AAA_high_cpu".into(), cpu_pct: 99.0, rss: 10 << 20, state: 'R', disk_read_bps: 0.0, disk_write_bps: 0.0, io_ok: true },
+            ProcInfo { pid: 2, name: "BBB_high_mem".into(), cpu_pct: 1.0, rss: 900 << 20, state: 'S', disk_read_bps: 5e6, disk_write_bps: 0.0, io_ok: true },
         ])));
         let pos = |t: &str, needle: &str| t.lines().position(|l| l.contains(needle));
 

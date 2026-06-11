@@ -66,7 +66,9 @@ impl Collector for ProcessCollector {
             let Some((comm, state, jiffies)) = read_proc_stat(pid) else {
                 continue;
             };
-            let (read_bytes, write_bytes) = read_proc_io(pid);
+            let io = read_proc_io(pid);
+            let io_ok = io.is_some();
+            let (read_bytes, write_bytes) = io.unwrap_or((0, 0));
             let prev = self.prev.get(&pid).copied();
             cur.insert(pid, Prev { jiffies, read_bytes, write_bytes });
 
@@ -95,6 +97,7 @@ impl Collector for ProcessCollector {
                 state,
                 disk_read_bps,
                 disk_write_bps,
+                io_ok,
             });
         }
 
@@ -106,11 +109,10 @@ impl Collector for ProcessCollector {
 }
 
 /// Disk bytes read/written from `/proc/<pid>/io` (read_bytes, write_bytes).
-/// Returns `(0, 0)` when inaccessible (needs ownership or CAP_SYS_PTRACE).
-fn read_proc_io(pid: i32) -> (u64, u64) {
-    let Ok(content) = fs::read_to_string(format!("/proc/{pid}/io")) else {
-        return (0, 0);
-    };
+/// Returns `None` when inaccessible (needs ownership or CAP_SYS_PTRACE), so the
+/// caller can distinguish "unknown" from "zero".
+fn read_proc_io(pid: i32) -> Option<(u64, u64)> {
+    let content = fs::read_to_string(format!("/proc/{pid}/io")).ok()?;
     let mut read = 0;
     let mut write = 0;
     for line in content.lines() {
@@ -120,7 +122,7 @@ fn read_proc_io(pid: i32) -> (u64, u64) {
             write = v.trim().parse().unwrap_or(0);
         }
     }
-    (read, write)
+    Some((read, write))
 }
 
 fn count_cpus() -> usize {

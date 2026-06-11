@@ -155,13 +155,16 @@ fn print_probe(state: &SharedState) {
         top.sort_by(|a, b| b.cpu_pct.total_cmp(&a.cpu_pct));
         println!("PROCS {} total; top by CPU:", procs.len());
         for p in top.iter().take(5) {
+            let disk = if p.io_ok {
+                format!("r{:.0}/w{:.0} KB/s", p.disk_read_bps / 1024.0, p.disk_write_bps / 1024.0)
+            } else {
+                "n/a (perm)".into()
+            };
             println!(
-                "  {:>7} {:>5.1}% {:>8} MB  disk r{:.0}/w{:.0} KB/s  {} {}",
+                "  {:>7} {:>5.1}% {:>8} MB  disk {disk}  {} {}",
                 p.pid,
                 p.cpu_pct,
                 p.rss / 1048576,
-                p.disk_read_bps / 1024.0,
-                p.disk_write_bps / 1024.0,
                 p.state,
                 p.name.chars().take(36).collect::<String>()
             );
