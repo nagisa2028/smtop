@@ -108,6 +108,9 @@ fn run_loop(terminal: &mut DefaultTerminal, state: &SharedState) -> io::Result<(
                         KeyCode::Char('1') => view.tab = Tab::Overview,
                         KeyCode::Char('2') => view.tab = Tab::Processes,
                         KeyCode::Char('s') if in_procs => view.proc_sort = view.proc_sort.next(),
+                        KeyCode::Char('c') if in_procs => view.proc_sort = ProcSort::Cpu,
+                        KeyCode::Char('m') if in_procs => view.proc_sort = ProcSort::Mem,
+                        KeyCode::Char('p') if in_procs => view.proc_sort = ProcSort::Pid,
                         KeyCode::Down | KeyCode::Char('j') if in_procs => {
                             view.proc_scroll += 1;
                         }
@@ -357,7 +360,11 @@ fn render_processes(frame: &mut Frame, area: Rect, state: &SharedState, view: &V
     let procs = state.procs.load_full();
     let count = procs.as_ref().map_or(0, |p| p.len());
     let block = Block::bordered().title(
-        format!(" Processes ({count})   sort:{} ", view.proc_sort.label()).bold(),
+        format!(
+            " Processes ({count})   sort:{}   keys: s cycle · c/m/p · ↑↓ scroll ",
+            view.proc_sort.label()
+        )
+        .bold(),
     );
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -374,10 +381,22 @@ fn render_processes(frame: &mut Frame, area: Rect, state: &SharedState, view: &V
     }
 
     let cmd_w = (inner.width as usize).saturating_sub(26).max(4);
-    let header = Line::from(Span::styled(
-        format!("{:>7} {:>5} {:>9} {} {:<cmd_w$}", "PID", "CPU%", "MEM", "S", "COMMAND"),
-        Style::new().add_modifier(Modifier::REVERSED),
-    ));
+    // Header row with the active sort column marked (▼) and highlighted.
+    let base = Style::new().add_modifier(Modifier::REVERSED);
+    let active = Style::new().fg(Color::Yellow).add_modifier(Modifier::REVERSED | Modifier::BOLD);
+    let col = |text: String, this: ProcSort| {
+        Span::styled(text, if view.proc_sort == this { active } else { base })
+    };
+    let mark = |this: ProcSort| if view.proc_sort == this { '▾' } else { ' ' };
+    let header = Line::from(vec![
+        col(format!("{:>6}{}", "PID", mark(ProcSort::Pid)), ProcSort::Pid),
+        Span::styled(" ", base),
+        col(format!("{:>4}{}", "CPU%", mark(ProcSort::Cpu)), ProcSort::Cpu),
+        Span::styled(" ", base),
+        col(format!("{:>8}{}", "MEM", mark(ProcSort::Mem)), ProcSort::Mem),
+        Span::styled(" S ", base),
+        Span::styled(format!("{:<cmd_w$}", "COMMAND"), base),
+    ]);
 
     let visible = (inner.height as usize).saturating_sub(1);
     let scroll = view.proc_scroll.min(list.len().saturating_sub(visible));
@@ -842,9 +861,45 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{CoreGroup, History};
+    use crate::model::{CoreGroup, History, ProcInfo, SharedState};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+
+    fn full_to_text(state: &SharedState, view: &View, w: u16, h: u16) -> String {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| render(f, state, view)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn processes_tab_sorts_by_selected_key() {
+        let state = SharedState::default();
+        state.procs.store(Some(std::sync::Arc::new(vec![
+            ProcInfo { pid: 1, name: "AAA_high_cpu".into(), cpu_pct: 99.0, rss: 10 << 20, state: 'R' },
+            ProcInfo { pid: 2, name: "BBB_high_mem".into(), cpu_pct: 1.0, rss: 900 << 20, state: 'S' },
+        ])));
+        let pos = |t: &str, needle: &str| t.lines().position(|l| l.contains(needle));
+
+        let mut view = View { tab: Tab::Processes, paused: false, proc_scroll: 0, proc_sort: ProcSort::Cpu };
+        let t = full_to_text(&state, &view, 80, 20);
+        assert!(pos(&t, "AAA_high_cpu") < pos(&t, "BBB_high_mem"), "CPU sort order wrong");
+
+        view.proc_sort = ProcSort::Mem;
+        let t = full_to_text(&state, &view, 80, 20);
+        assert!(pos(&t, "BBB_high_mem") < pos(&t, "AAA_high_cpu"), "MEM sort order wrong");
+
+        view.proc_sort = ProcSort::Pid;
+        let t = full_to_text(&state, &view, 80, 20);
+        assert!(pos(&t, "AAA_high_cpu") < pos(&t, "BBB_high_mem"), "PID sort order wrong");
+    }
 
     fn synth(core_groups: Vec<CoreGroup>, ncpu: usize) -> CpuSnapshot {
         CpuSnapshot {
