@@ -16,10 +16,59 @@ use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Axis, Block, Chart, Dataset, Gauge, GraphType, Paragraph};
 
-use crate::model::{CoreGroup, CpuSnapshot, DiskSnapshot, Fan, FsSnapshot, GpuSnapshot, GpuVendor, NetSnapshot, SharedState};
+use crate::model::{CoreGroup, CpuSnapshot, DiskSnapshot, Fan, FsSnapshot, GpuSnapshot, GpuVendor, NetSnapshot, ProcInfo, SharedState};
 use widgets::{fmt_bytes, fmt_link, fmt_rate, fmt_uptime, hbar, usage_color};
 
 const FRAME_MS: u64 = 250;
+
+#[derive(Clone, Copy, PartialEq)]
+enum Tab {
+    Overview,
+    Processes,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum ProcSort {
+    Cpu,
+    Mem,
+    Pid,
+}
+
+impl ProcSort {
+    fn next(self) -> Self {
+        match self {
+            ProcSort::Cpu => ProcSort::Mem,
+            ProcSort::Mem => ProcSort::Pid,
+            ProcSort::Pid => ProcSort::Cpu,
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            ProcSort::Cpu => "CPU",
+            ProcSort::Mem => "MEM",
+            ProcSort::Pid => "PID",
+        }
+    }
+}
+
+/// Mutable view state owned by the event loop.
+struct View {
+    tab: Tab,
+    paused: bool,
+    proc_scroll: usize,
+    proc_sort: ProcSort,
+}
+
+impl Default for View {
+    fn default() -> Self {
+        Self {
+            tab: Tab::Overview,
+            paused: false,
+            proc_scroll: 0,
+            proc_sort: ProcSort::Cpu,
+        }
+    }
+}
 
 pub fn run(state: Arc<SharedState>, shutdown: Arc<AtomicBool>) -> io::Result<()> {
     let mut terminal = ratatui::init();
@@ -30,27 +79,44 @@ pub fn run(state: Arc<SharedState>, shutdown: Arc<AtomicBool>) -> io::Result<()>
 }
 
 fn run_loop(terminal: &mut DefaultTerminal, state: &SharedState) -> io::Result<()> {
-    let mut paused = false;
+    let mut view = View::default();
     let mut redraw = true;
     loop {
-        // While paused the screen is frozen; only redraw on toggle/resize.
-        if !paused || redraw {
-            terminal.draw(|frame| render(frame, state, paused))?;
+        // While paused the screen is frozen; only redraw on toggle/resize/input.
+        if !view.paused || redraw {
+            terminal.draw(|frame| render(frame, state, &view))?;
             redraw = false;
         }
         if event::poll(Duration::from_millis(FRAME_MS))? {
             match event::read()? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        return Ok(());
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    redraw = true;
+                    let in_procs = view.tab == Tab::Processes;
+                    match key.code {
+                        KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            return Ok(());
+                        }
+                        KeyCode::Char(' ') => view.paused = !view.paused,
+                        KeyCode::Tab | KeyCode::BackTab => {
+                            view.tab = match view.tab {
+                                Tab::Overview => Tab::Processes,
+                                Tab::Processes => Tab::Overview,
+                            };
+                            view.proc_scroll = 0;
+                        }
+                        KeyCode::Char('1') => view.tab = Tab::Overview,
+                        KeyCode::Char('2') => view.tab = Tab::Processes,
+                        KeyCode::Char('s') if in_procs => view.proc_sort = view.proc_sort.next(),
+                        KeyCode::Down | KeyCode::Char('j') if in_procs => {
+                            view.proc_scroll += 1;
+                        }
+                        KeyCode::Up | KeyCode::Char('k') if in_procs => {
+                            view.proc_scroll = view.proc_scroll.saturating_sub(1);
+                        }
+                        _ => redraw = false,
                     }
-                    KeyCode::Char(' ') => {
-                        paused = !paused;
-                        redraw = true;
-                    }
-                    _ => {}
-                },
+                }
                 Event::Resize(_, _) => redraw = true,
                 _ => {}
             }
@@ -58,7 +124,7 @@ fn run_loop(terminal: &mut DefaultTerminal, state: &SharedState) -> io::Result<(
     }
 }
 
-fn render(frame: &mut Frame, state: &SharedState, paused: bool) {
+fn render(frame: &mut Frame, state: &SharedState, view: &View) {
     let full = frame.area();
     if full.width < 50 || full.height < 18 {
         let p = Paragraph::new("terminal too small — resize (≥50×18)").style(Style::new().fg(Color::Yellow));
@@ -66,11 +132,16 @@ fn render(frame: &mut Frame, state: &SharedState, paused: bool) {
         return;
     }
 
-    // Reserve the top row for a header, tiers fill the rest.
+    // Reserve the top row for a header; the selected tab fills the rest.
     let split = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(full);
-    render_header(frame, split[0], state, paused);
-    let area = split[1];
+    render_header(frame, split[0], state, view);
+    match view.tab {
+        Tab::Overview => render_overview(frame, split[1], state),
+        Tab::Processes => render_processes(frame, split[1], state, view),
+    }
+}
 
+fn render_overview(frame: &mut Frame, area: Rect, state: &SharedState) {
     // Responsive tier heights. The CPU tier grows to fit the per-core grid
     // (which expands with core/socket count), keeping ≥6 rows for GPUs.
     let cpu = state.cpu.load_full();
@@ -218,8 +289,8 @@ fn hostname() -> &'static str {
     })
 }
 
-/// Top header: identity, clock, per-collector liveness, key hints.
-fn render_header(frame: &mut Frame, area: Rect, state: &SharedState, paused: bool) {
+/// Top header: identity, clock, tab bar, per-collector liveness, key hints.
+fn render_header(frame: &mut Frame, area: Rect, state: &SharedState, view: &View) {
     let now = chrono::Local::now().format("%H:%M:%S");
     let mut spans = vec![
         Span::styled("mon", Style::new().fg(Color::Cyan).bold()),
@@ -227,33 +298,105 @@ fn render_header(frame: &mut Frame, area: Rect, state: &SharedState, paused: boo
         Span::styled(hostname(), Style::new().fg(Color::White)),
         Span::styled(format!("  {now}  "), Style::new().add_modifier(Modifier::DIM)),
     ];
+    // Tab bar: selected tab reversed, others dim.
+    for (i, (tab, title)) in [(Tab::Overview, "Overview"), (Tab::Processes, "Processes")]
+        .into_iter()
+        .enumerate()
+    {
+        let sel = view.tab == tab;
+        let style = if sel {
+            Style::new().fg(Color::Black).bg(Color::Cyan).bold()
+        } else {
+            Style::new().add_modifier(Modifier::DIM)
+        };
+        spans.push(Span::styled(format!(" {}:{title} ", i + 1), style));
+        spans.push(Span::raw(" "));
+    }
     // Liveness: green once a collector has published, red if it never has.
-    let mut stat = |label: &str, alive: bool| {
+    spans.push(Span::raw(" "));
+    for (label, alive) in [
+        ("cpu", state.cpu.load_full().is_some()),
+        ("gpu", state.nvidia.load_full().is_some() || state.amd.load_full().is_some()),
+        ("net", state.net.load_full().is_some()),
+        ("disk", state.disk.load_full().is_some()),
+        ("fs", state.fs.load_full().is_some()),
+    ] {
         spans.push(Span::styled(
             format!("{label} "),
             Style::new().fg(if alive { Color::Green } else { Color::Red }),
         ));
-    };
-    let gpu_alive =
-        state.nvidia.load_full().is_some() || state.amd.load_full().is_some();
-    stat("cpu", state.cpu.load_full().is_some());
-    stat("gpu", gpu_alive);
-    stat("net", state.net.load_full().is_some());
-    stat("disk", state.disk.load_full().is_some());
-    stat("fs", state.fs.load_full().is_some());
-    if paused {
-        spans.push(Span::styled(
-            " PAUSED ",
-            Style::new().fg(Color::Black).bg(Color::Yellow),
-        ));
+    }
+    if view.paused {
+        spans.push(Span::styled(" PAUSED ", Style::new().fg(Color::Black).bg(Color::Yellow)));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    let hints = if view.tab == Tab::Processes {
+        "Tab:switch  s:sort  ↑↓:scroll  q:quit"
+    } else {
+        "Tab:switch  space:pause  q:quit"
+    };
     frame.render_widget(
-        Paragraph::new("space:pause  q:quit")
+        Paragraph::new(hints)
             .alignment(Alignment::Right)
             .style(Style::new().add_modifier(Modifier::DIM)),
         area,
     );
+}
+
+fn proc_state_style(s: char) -> Style {
+    match s {
+        'R' => Style::new().fg(Color::Green),
+        'D' => Style::new().fg(Color::Red),
+        'Z' => Style::new().fg(Color::Yellow),
+        _ => Style::new().add_modifier(Modifier::DIM),
+    }
+}
+
+/// Processes tab: a sortable, scrollable PID/CPU/MEM table.
+fn render_processes(frame: &mut Frame, area: Rect, state: &SharedState, view: &View) {
+    let procs = state.procs.load_full();
+    let count = procs.as_ref().map_or(0, |p| p.len());
+    let block = Block::bordered().title(
+        format!(" Processes ({count})   sort:{} ", view.proc_sort.label()).bold(),
+    );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let Some(procs) = procs else {
+        frame.render_widget(Paragraph::new("collecting…".dim()), inner);
+        return;
+    };
+    let mut list: Vec<ProcInfo> = procs.to_vec();
+    match view.proc_sort {
+        ProcSort::Cpu => list.sort_by(|a, b| b.cpu_pct.total_cmp(&a.cpu_pct)),
+        ProcSort::Mem => list.sort_by_key(|p| std::cmp::Reverse(p.rss)),
+        ProcSort::Pid => list.sort_by_key(|p| p.pid),
+    }
+
+    let cmd_w = (inner.width as usize).saturating_sub(26).max(4);
+    let header = Line::from(Span::styled(
+        format!("{:>7} {:>5} {:>9} {} {:<cmd_w$}", "PID", "CPU%", "MEM", "S", "COMMAND"),
+        Style::new().add_modifier(Modifier::REVERSED),
+    ));
+
+    let visible = (inner.height as usize).saturating_sub(1);
+    let scroll = view.proc_scroll.min(list.len().saturating_sub(visible));
+
+    let mut lines = vec![header];
+    for p in list.iter().skip(scroll).take(visible) {
+        let name: String = p.name.chars().take(cmd_w).collect();
+        lines.push(Line::from(vec![
+            Span::raw(format!("{:>7} ", p.pid)),
+            Span::styled(
+                format!("{:>5.1} ", p.cpu_pct),
+                Style::new().fg(usage_color(p.cpu_pct.min(100.0))),
+            ),
+            Span::raw(format!("{:>9} ", fmt_bytes(p.rss))),
+            Span::styled(format!("{} ", p.state), proc_state_style(p.state)),
+            Span::styled(name, Style::new().add_modifier(Modifier::DIM)),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn render_cpu(frame: &mut Frame, area: Rect, cpu: &CpuSnapshot) {

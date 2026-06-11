@@ -64,6 +64,12 @@ fn main() -> std::io::Result<()> {
             s.fs.store(Some(Arc::new(o)))
         });
     }
+    {
+        let s = state.clone();
+        spawn(collector::proc::ProcessCollector::new(), shutdown.clone(), move |o| {
+            s.procs.store(Some(Arc::new(o)))
+        });
+    }
 
     // Headless probe: dump one sample and exit (useful over SSH, no TTY needed).
     if std::env::args().any(|a| a == "--probe") {
@@ -142,6 +148,21 @@ fn print_probe(state: &SharedState) {
     if let Some(fs) = state.fs.load_full() {
         for f in fs.iter().take(6) {
             println!("FS   {}  {}/{} GB", f.mount, f.used / 1073741824, f.total / 1073741824);
+        }
+    }
+    if let Some(procs) = state.procs.load_full() {
+        let mut top = procs.to_vec();
+        top.sort_by(|a, b| b.cpu_pct.total_cmp(&a.cpu_pct));
+        println!("PROCS {} total; top by CPU:", procs.len());
+        for p in top.iter().take(5) {
+            println!(
+                "  {:>7} {:>5.1}% {:>8} MB {} {}",
+                p.pid,
+                p.cpu_pct,
+                p.rss / 1048576,
+                p.state,
+                p.name.chars().take(40).collect::<String>()
+            );
         }
     }
 }

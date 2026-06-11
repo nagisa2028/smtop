@@ -164,6 +164,18 @@ pub struct FsSnapshot {
     pub total: u64,
 }
 
+/// One process row for the Processes tab.
+#[derive(Clone, Debug)]
+pub struct ProcInfo {
+    pub pid: i32,
+    pub name: String,
+    /// CPU usage, single-core normalized (100 = one full core).
+    pub cpu_pct: f32,
+    /// Resident set size in bytes.
+    pub rss: u64,
+    pub state: char,
+}
+
 /// Lock-free shared state: one `ArcSwapOption` slot per collector source.
 #[derive(Default)]
 pub struct SharedState {
@@ -173,4 +185,5 @@ pub struct SharedState {
     pub net: ArcSwapOption<Vec<NetSnapshot>>,
     pub disk: ArcSwapOption<Vec<DiskSnapshot>>,
     pub fs: ArcSwapOption<Vec<FsSnapshot>>,
+    pub procs: ArcSwapOption<Vec<ProcInfo>>,
 }

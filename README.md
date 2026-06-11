@@ -25,7 +25,8 @@ cargo build --release
 ./target/release/mon --probe          # TTYなしで1回ダンプ(SSH確認用)
 ```
 
-- ヘッダにホスト名・時刻・各コレクタの稼働状況(緑=稼働/赤=未publish)を表示。
+- ヘッダにホスト名・時刻・タブ・各コレクタの稼働状況(緑=稼働/赤=未publish)を表示。
+- タブ: `Tab`/`1`/`2` で **Overview**(ダッシュボード)と **Processes**(PID一覧)を切替。Processes は `s` でソート(CPU/MEM/PID)、`↑↓` でスクロール。
 - NVIDIA対応は `nvidia` feature（デフォルト有効）。`nvml-wrapper` が `libnvidia-ml` を**実行時dlopen**するため、ドライバが無い環境でもビルド・実行でき、その場合 NVIDIA GPU は単に表示されない。
 - NVMLを完全に外したい場合: `cargo build --release --no-default-features`
 
