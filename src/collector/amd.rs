@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use super::Collector;
@@ -165,7 +166,84 @@ fn read_name(dev: &Path) -> String {
         .lines()
         .find_map(|l| l.strip_prefix("PCI_ID="))
         .unwrap_or("?");
+    // PCI_ID is "VVVV:DDDD" (hex). Resolve the device id to a marketing name via
+    // the system pci.ids database; fall back to the raw id when it's unavailable.
+    if let Some((_vendor, dev_id)) = pci_id.split_once(':')
+        && let Ok(id) = u16::from_str_radix(dev_id.trim(), 16)
+        && let Some(name) = amd_pci_names().get(&id)
+    {
+        return name.clone();
+    }
     format!("AMD {pci_id}")
+}
+
+/// Standard locations for the `pci.ids` database (`lspci`'s name source).
+const PCI_IDS_PATHS: &[&str] = &[
+    "/usr/share/hwdata/pci.ids",
+    "/usr/share/misc/pci.ids",
+    "/var/lib/pciutils/pci.ids",
+];
+
+/// AMD (vendor `0x1002`) device-id → marketing name, parsed once from the
+/// system `pci.ids`. Empty if the database isn't installed — callers then fall
+/// back to the raw PCI id. amdgpu's vendor is always 0x1002, so we only scan
+/// that one block rather than building the whole ~40k-line table.
+fn amd_pci_names() -> &'static HashMap<u16, String> {
+    static NAMES: OnceLock<HashMap<u16, String>> = OnceLock::new();
+    NAMES.get_or_init(|| {
+        PCI_IDS_PATHS
+            .iter()
+            .find_map(|p| fs::read_to_string(p).ok())
+            .map(|c| parse_pci_ids_vendor(&c, 0x1002))
+            .unwrap_or_default()
+    })
+}
+
+/// Parse device-id → name for a single vendor block of a `pci.ids` file.
+///
+/// Format: vendor lines have no indent (`1002  AMD/ATI`), device lines are
+/// one-tab indented (`\t7551  Navi 48 [...]`), subsystem lines are two-tab
+/// (ignored). We start collecting at the target vendor and stop at the next
+/// unindented (vendor) line.
+fn parse_pci_ids_vendor(content: &str, vendor: u16) -> HashMap<u16, String> {
+    let mut map = HashMap::new();
+    let mut in_vendor = false;
+    for line in content.lines() {
+        if line.starts_with('#') || line.trim().is_empty() {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix('\t') {
+            // Two-tab lines are subsystem entries; skip them.
+            if !in_vendor || rest.starts_with('\t') {
+                continue;
+            }
+            if let Some((id, name)) = rest.split_once(char::is_whitespace)
+                && let Ok(d) = u16::from_str_radix(id.trim(), 16)
+            {
+                map.insert(d, marketing_name(name.trim()));
+            }
+        } else {
+            // Unindented = vendor line. Leaving our block ends the scan.
+            if in_vendor {
+                break;
+            }
+            in_vendor = line
+                .split_once(char::is_whitespace)
+                .and_then(|(id, _)| u16::from_str_radix(id.trim(), 16).ok())
+                == Some(vendor);
+        }
+    }
+    map
+}
+
+/// Prefer the bracketed board name ("Navi 48 [Radeon AI PRO R9700]" →
+/// "Radeon AI PRO R9700"), which is the user-facing marketing name; otherwise
+/// use the chip name as-is ("Barcelo").
+fn marketing_name(s: &str) -> String {
+    match (s.find('['), s.rfind(']')) {
+        (Some(o), Some(c)) if c > o + 1 => s[o + 1..c].to_string(),
+        _ => s.to_string(),
+    }
 }
 
 /// Returns `(temp_c, power_w, fan)` from the card's `amdgpu` hwmon node.
@@ -377,5 +455,45 @@ mod tests {
         let table = "0: 200Mhz \n1: 400Mhz *\n2: 2000Mhz ";
         assert_eq!(parse_current_clock(table), Some(400));
         assert_eq!(parse_current_clock("0: 200Mhz \n1: 400Mhz "), None);
+    }
+
+    #[test]
+    fn pci_ids_vendor_block_isolates_devices() {
+        // Two vendors, with subsystem lines and a comment interleaved.
+        let db = "\
+# comment line
+1001  Other Vendor
+\t1234  Should Not Appear
+1002  Advanced Micro Devices, Inc. [AMD/ATI]
+\t7551  Navi 48 [Radeon AI PRO R9700]
+\t\t1043 8950  Subsystem Should Be Skipped
+\t15e7  Barcelo
+10de  NVIDIA Corporation
+\t2504  GA106 [GeForce RTX 3060]
+";
+        let amd = parse_pci_ids_vendor(db, 0x1002);
+        // Bracketed board name extracted.
+        assert_eq!(
+            amd.get(&0x7551).map(String::as_str),
+            Some("Radeon AI PRO R9700")
+        );
+        // No brackets → chip name verbatim.
+        assert_eq!(amd.get(&0x15e7).map(String::as_str), Some("Barcelo"));
+        // Other vendors and subsystem (two-tab) lines are excluded.
+        assert!(!amd.contains_key(&0x1234));
+        assert!(!amd.contains_key(&0x2504));
+        assert!(!amd.contains_key(&0x8950));
+        assert_eq!(amd.len(), 2);
+    }
+
+    #[test]
+    fn marketing_name_prefers_bracketed_board() {
+        assert_eq!(
+            marketing_name("Navi 48 [Radeon AI PRO R9700]"),
+            "Radeon AI PRO R9700"
+        );
+        assert_eq!(marketing_name("Barcelo"), "Barcelo");
+        // Degenerate brackets fall back to the original string.
+        assert_eq!(marketing_name("Weird []"), "Weird []");
     }
 }
