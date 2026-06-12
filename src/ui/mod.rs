@@ -24,10 +24,41 @@ use widgets::{fmt_bytes, fmt_link, fmt_rate, fmt_uptime, hbar, usage_color};
 
 const FRAME_MS: u64 = 250;
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Tab {
     Overview,
     Processes,
+    Gpu,
+}
+
+impl Tab {
+    /// Display order — also the number-key order (`1`=first, …).
+    const ALL: &'static [Tab] = &[Tab::Overview, Tab::Processes, Tab::Gpu];
+
+    fn title(self) -> &'static str {
+        match self {
+            Tab::Overview => "Overview",
+            Tab::Processes => "Processes",
+            Tab::Gpu => "GPU",
+        }
+    }
+
+    fn index(self) -> usize {
+        Self::ALL.iter().position(|&t| t == self).unwrap_or(0)
+    }
+
+    /// Tab for a 0-based slot (number key `n+1`), if in range.
+    fn from_number(n: usize) -> Option<Tab> {
+        Self::ALL.get(n).copied()
+    }
+
+    fn next(self) -> Tab {
+        Self::ALL[(self.index() + 1) % Self::ALL.len()]
+    }
+
+    fn prev(self) -> Tab {
+        Self::ALL[(self.index() + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -74,6 +105,8 @@ struct View {
     proc_sort: ProcSort,
     /// Reverse (ascending) the active process sort.
     proc_rev: bool,
+    /// Selected GPU index (combined nvidia→amd order) on the GPU tab.
+    gpu_sel: usize,
 }
 
 impl Default for View {
@@ -84,8 +117,16 @@ impl Default for View {
             proc_scroll: 0,
             proc_sort: ProcSort::Cpu,
             proc_rev: false,
+            gpu_sel: 0,
         }
     }
+}
+
+/// Switch tabs, resetting per-tab cursors so a stale scroll/selection doesn't
+/// carry over.
+fn switch_tab(view: &mut View, tab: Tab) {
+    view.tab = tab;
+    view.proc_scroll = 0;
 }
 
 /// Select a sort column; re-selecting the active one flips the direction.
@@ -120,21 +161,34 @@ fn run_loop(terminal: &mut DefaultTerminal, state: &SharedState) -> io::Result<(
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     redraw = true;
                     let in_procs = view.tab == Tab::Processes;
+                    let in_gpu = view.tab == Tab::Gpu;
                     match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                        KeyCode::Char('q') => return Ok(()),
                         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             return Ok(());
                         }
-                        KeyCode::Char(' ') => view.paused = !view.paused,
-                        KeyCode::Tab | KeyCode::BackTab => {
-                            view.tab = match view.tab {
-                                Tab::Overview => Tab::Processes,
-                                Tab::Processes => Tab::Overview,
-                            };
-                            view.proc_scroll = 0;
+                        // Esc backs out one level: from any tab to Overview, and
+                        // from Overview it quits.
+                        KeyCode::Esc => {
+                            if view.tab == Tab::Overview {
+                                return Ok(());
+                            }
+                            switch_tab(&mut view, Tab::Overview);
                         }
-                        KeyCode::Char('1') => view.tab = Tab::Overview,
-                        KeyCode::Char('2') => view.tab = Tab::Processes,
+                        KeyCode::Char(' ') => view.paused = !view.paused,
+                        KeyCode::Tab => {
+                            let t = view.tab.next();
+                            switch_tab(&mut view, t);
+                        }
+                        KeyCode::BackTab => {
+                            let t = view.tab.prev();
+                            switch_tab(&mut view, t);
+                        }
+                        KeyCode::Char(c @ '1'..='9') => {
+                            if let Some(tab) = Tab::from_number(c as usize - '1' as usize) {
+                                switch_tab(&mut view, tab);
+                            }
+                        }
                         KeyCode::Char('s') if in_procs => {
                             view.proc_sort = view.proc_sort.next();
                             view.proc_rev = false;
@@ -155,6 +209,13 @@ fn run_loop(terminal: &mut DefaultTerminal, state: &SharedState) -> io::Result<(
                         }
                         KeyCode::Up | KeyCode::Char('k') if in_procs => {
                             view.proc_scroll = view.proc_scroll.saturating_sub(1);
+                        }
+                        KeyCode::Down | KeyCode::Char('j') if in_gpu => {
+                            let count = gpu_count(state);
+                            view.gpu_sel = (view.gpu_sel + 1).min(count.saturating_sub(1));
+                        }
+                        KeyCode::Up | KeyCode::Char('k') if in_gpu => {
+                            view.gpu_sel = view.gpu_sel.saturating_sub(1);
                         }
                         _ => redraw = false,
                     }
@@ -181,7 +242,15 @@ fn render(frame: &mut Frame, state: &SharedState, view: &View) {
     match view.tab {
         Tab::Overview => render_overview(frame, split[1], state),
         Tab::Processes => render_processes(frame, split[1], state, view),
+        Tab::Gpu => render_gpu_tab(frame, split[1], state, view),
     }
+}
+
+/// Number of GPUs across both vendors (combined nvidia→amd order).
+fn gpu_count(state: &SharedState) -> usize {
+    let nv = state.nvidia.load_full().map_or(0, |g| g.len());
+    let amd = state.amd.load_full().map_or(0, |g| g.len());
+    nv + amd
 }
 
 fn render_overview(frame: &mut Frame, area: Rect, state: &SharedState) {
@@ -228,6 +297,19 @@ fn render_overview(frame: &mut Frame, area: Rect, state: &SharedState) {
         disk.as_deref().map(|v| v.as_slice()).unwrap_or(&[]),
         fs.as_deref().map(|v| v.as_slice()).unwrap_or(&[]),
     );
+}
+
+/// GPU tab: per-GPU detail (filled in by Phase ②).
+fn render_gpu_tab(frame: &mut Frame, area: Rect, state: &SharedState, _view: &View) {
+    let block = Block::bordered().title(" GPU ".bold());
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let msg = if gpu_count(state) == 0 {
+        "no GPUs detected"
+    } else {
+        "GPU detail — coming soon"
+    };
+    frame.render_widget(Paragraph::new(msg.dim()), inner);
 }
 
 /// A single- or dual-series Braille line chart over the given owned point sets.
@@ -354,17 +436,13 @@ fn render_header(frame: &mut Frame, area: Rect, state: &SharedState, view: &View
         ),
     ];
     // Tab bar: selected tab reversed, others dim.
-    for (i, (tab, title)) in [(Tab::Overview, "Overview"), (Tab::Processes, "Processes")]
-        .into_iter()
-        .enumerate()
-    {
-        let sel = view.tab == tab;
-        let style = if sel {
+    for (i, tab) in Tab::ALL.iter().enumerate() {
+        let style = if view.tab == *tab {
             Style::new().fg(Color::Black).bg(Color::Cyan).bold()
         } else {
             Style::new().add_modifier(Modifier::DIM)
         };
-        spans.push(Span::styled(format!(" {}:{title} ", i + 1), style));
+        spans.push(Span::styled(format!(" {}:{} ", i + 1, tab.title()), style));
         spans.push(Span::raw(" "));
     }
     // Liveness by freshness: green = recently published, yellow = published
@@ -399,10 +477,10 @@ fn render_header(frame: &mut Frame, area: Rect, state: &SharedState, view: &View
         ));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
-    let hints = if view.tab == Tab::Processes {
-        "Tab/1/2:tabs  c/m/d/D/g/G/p:sort  r:reverse  ↑↓:scroll  q:quit"
-    } else {
-        "Tab/1/2:tabs  space:pause  q:quit"
+    let hints = match view.tab {
+        Tab::Processes => "Tab/1-3:tabs  c/m/d/D/g/G/p:sort  r:reverse  ↑↓:scroll  Esc/q:quit",
+        Tab::Gpu => "Tab/1-3:tabs  ↑↓:select GPU  Esc:Overview  q:quit",
+        Tab::Overview => "Tab/1-3:tabs  space:pause  q:quit",
     };
     frame.render_widget(
         Paragraph::new(hints)
@@ -1108,6 +1186,20 @@ mod tests {
     }
 
     #[test]
+    fn tab_number_and_cycle() {
+        // Number keys map 0-based slots; out of range yields None.
+        assert_eq!(Tab::from_number(0), Some(Tab::Overview));
+        assert_eq!(Tab::from_number(1), Some(Tab::Processes));
+        assert_eq!(Tab::from_number(2), Some(Tab::Gpu));
+        assert_eq!(Tab::from_number(3), None);
+        // next/prev wrap around the ordered list.
+        assert_eq!(Tab::Overview.next(), Tab::Processes);
+        assert_eq!(Tab::Gpu.next(), Tab::Overview);
+        assert_eq!(Tab::Overview.prev(), Tab::Gpu);
+        assert_eq!(Tab::Processes.prev(), Tab::Overview);
+    }
+
+    #[test]
     fn processes_tab_sorts_by_selected_key() {
         let state = SharedState::default();
         state
@@ -1149,10 +1241,8 @@ mod tests {
 
         let mut view = View {
             tab: Tab::Processes,
-            paused: false,
-            proc_scroll: 0,
             proc_sort: ProcSort::Cpu,
-            proc_rev: false,
+            ..View::default()
         };
         let t = full_to_text(&state, &view, 80, 20);
         assert!(
