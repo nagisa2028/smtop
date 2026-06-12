@@ -153,6 +153,10 @@ pub struct GpuSnapshot {
     pub pcie_tx_bps: Option<f64>,
     /// Negotiated PCIe link width (lanes).
     pub pcie_width: Option<u16>,
+    /// Video encoder / decoder utilization (0..=100). NVIDIA only (NVENC/NVDEC
+    /// via NVML); amdgpu doesn't expose VCN engine util through sysfs.
+    pub enc_pct: Option<f32>,
+    pub dec_pct: Option<f32>,
     /// AMD only: the GPU is runtime-suspended (D3cold), so SMU telemetry
     /// (utilization/temp/power/clock) is unavailable until it resumes.
     pub suspended: bool,

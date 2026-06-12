@@ -83,6 +83,10 @@ impl Collector for NvidiaCollector {
                 .ok()
                 .map(|kb| kb as f64 * 1024.0);
             let pcie_width = dev.current_pcie_link_width().ok().map(|w| w as u16);
+            // NVENC/NVDEC utilization (best-effort; some GPUs/driver modes
+            // report Unsupported).
+            let enc_pct = dev.encoder_utilization().ok().map(|u| u.utilization as f32);
+            let dec_pct = dev.decoder_utilization().ok().map(|u| u.utilization as f32);
 
             let h = self.hist.entry(i).or_default();
             h.util.push(busy_pct as f64);
@@ -111,6 +115,8 @@ impl Collector for NvidiaCollector {
                 pcie_rx_bps,
                 pcie_tx_bps,
                 pcie_width,
+                enc_pct,
+                dec_pct,
                 suspended: false,
                 note: None,
             });

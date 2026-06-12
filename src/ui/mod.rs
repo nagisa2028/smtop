@@ -2,6 +2,7 @@
 
 mod widgets;
 
+use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -17,8 +18,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Axis, Block, Chart, Dataset, Gauge, GraphType, Paragraph};
 
 use crate::model::{
-    CoreGroup, CpuSnapshot, DiskSnapshot, Fan, FsSnapshot, GpuSnapshot, GpuVendor, NetSnapshot,
-    ProcInfo, SharedState,
+    CoreGroup, CpuSnapshot, DiskSnapshot, Fan, FsSnapshot, GpuProcUse, GpuSnapshot, GpuVendor,
+    NetSnapshot, ProcInfo, SharedState,
 };
 use widgets::{fmt_bytes, fmt_link, fmt_rate, fmt_uptime, hbar, usage_color};
 
@@ -278,13 +279,7 @@ fn render_overview(frame: &mut Frame, area: Rect, state: &SharedState) {
         render_cpu(frame, tiers[0], cpu);
     }
 
-    let mut gpus: Vec<GpuSnapshot> = Vec::new();
-    if let Some(nv) = state.nvidia.load_full() {
-        gpus.extend(nv.iter().cloned());
-    }
-    if let Some(amd) = state.amd.load_full() {
-        gpus.extend(amd.iter().cloned());
-    }
+    let gpus = collect_gpus(state);
     render_gpus(frame, tiers[1], &gpus);
 
     let net = state.net.load_full();
@@ -299,17 +294,244 @@ fn render_overview(frame: &mut Frame, area: Rect, state: &SharedState) {
     );
 }
 
-/// GPU tab: per-GPU detail (filled in by Phase ②).
-fn render_gpu_tab(frame: &mut Frame, area: Rect, state: &SharedState, _view: &View) {
-    let block = Block::bordered().title(" GPU ".bold());
+/// Combined GPU list across both vendors, nvidia first then amd (the order the
+/// `index`/tag scheme and the Overview cards use).
+fn collect_gpus(state: &SharedState) -> Vec<GpuSnapshot> {
+    let mut gpus = Vec::new();
+    if let Some(nv) = state.nvidia.load_full() {
+        gpus.extend(nv.iter().cloned());
+    }
+    if let Some(amd) = state.amd.load_full() {
+        gpus.extend(amd.iter().cloned());
+    }
+    gpus
+}
+
+/// The per-process GPU tag a snapshot corresponds to (`N0`, `A1`, …), matching
+/// the labels produced by the gpuproc collector.
+fn gpu_tag(g: &GpuSnapshot) -> String {
+    let v = match g.vendor {
+        GpuVendor::Nvidia => 'N',
+        GpuVendor::Amd => 'A',
+    };
+    format!("{v}{}", g.index)
+}
+
+/// Processes touching the GPU identified by `tag`, as `(pid, util%, vram, name)`
+/// rows sorted by GPU% (then VRAM) descending. A process's comma-separated
+/// label is matched token-exact so `N0` doesn't also match `N1`.
+fn procs_for_gpu(
+    tag: &str,
+    gpu_procs: &HashMap<i32, GpuProcUse>,
+    name_of: &HashMap<i32, String>,
+) -> Vec<(i32, f32, u64, String)> {
+    let mut rows: Vec<(i32, f32, u64, String)> = gpu_procs
+        .iter()
+        .filter(|(_, g)| g.label.split(',').any(|t| t == tag))
+        .map(|(&pid, g)| {
+            (
+                pid,
+                g.util_pct,
+                g.vram,
+                name_of.get(&pid).cloned().unwrap_or_default(),
+            )
+        })
+        .collect();
+    rows.sort_by(|a, b| b.1.total_cmp(&a.1).then(b.2.cmp(&a.2)));
+    rows
+}
+
+/// GPU tab: one full-width band per GPU (util+VRAM chart, telemetry incl.
+/// enc/dec, and that GPU's process list), stacked vertically. `↑↓` highlights
+/// the selected band.
+fn render_gpu_tab(frame: &mut Frame, area: Rect, state: &SharedState, view: &View) {
+    let gpus = collect_gpus(state);
+    if gpus.is_empty() {
+        let block = Block::bordered().title(" GPU ".bold());
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        frame.render_widget(Paragraph::new("no GPUs detected".dim()), inner);
+        return;
+    }
+    let sel = view.gpu_sel.min(gpus.len() - 1);
+
+    // pid -> name, built once for the per-GPU process lists.
+    let name_of: HashMap<i32, String> = state
+        .procs
+        .load_full()
+        .map(|p| p.iter().map(|pi| (pi.pid, pi.name.clone())).collect())
+        .unwrap_or_default();
+    let gpu_procs = state.gpu_procs.load_full();
+
+    let bands = Layout::vertical(vec![Constraint::Fill(1); gpus.len()]).split(area);
+    for (i, g) in gpus.iter().enumerate() {
+        render_gpu_band(
+            frame,
+            bands[i],
+            g,
+            i == sel,
+            gpu_procs.as_deref().map(|s| &**s),
+            &name_of,
+        );
+    }
+}
+
+fn render_gpu_band(
+    frame: &mut Frame,
+    area: Rect,
+    g: &GpuSnapshot,
+    selected: bool,
+    gpu_procs: Option<&HashMap<i32, GpuProcUse>>,
+    name_of: &HashMap<i32, String>,
+) {
+    let (color, sym) = match g.vendor {
+        GpuVendor::Nvidia => (Color::Green, "⬢"),
+        GpuVendor::Amd => (Color::Red, "⬡"),
+    };
+    // The selected band is bright; the rest are dimmed so the cursor reads.
+    let border_style = if selected {
+        Style::new().fg(color).add_modifier(Modifier::BOLD)
+    } else {
+        Style::new().fg(color).add_modifier(Modifier::DIM)
+    };
+    let cursor = if selected { "▸ " } else { "  " };
+    let block = Block::bordered().border_style(border_style).title(
+        format!(
+            "{cursor}GPU{} {} {}  {:.0}%",
+            g.index, sym, g.name, g.busy_pct
+        )
+        .bold(),
+    );
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let msg = if gpu_count(state) == 0 {
-        "no GPUs detected"
-    } else {
-        "GPU detail — coming soon"
-    };
-    frame.render_widget(Paragraph::new(msg.dim()), inner);
+    if inner.height == 0 {
+        return;
+    }
+
+    let rows = Layout::vertical([
+        Constraint::Min(2),    // util + vram chart
+        Constraint::Length(1), // vram gauge
+        Constraint::Length(1), // telemetry incl. enc/dec
+        Constraint::Min(0),    // process list
+    ])
+    .split(inner);
+
+    let pts = g.util_hist.points();
+    let vram_pts = g.vram_hist.points();
+    let series = [
+        (usage_color(g.busy_pct), pts.as_slice()),
+        (Color::Blue, vram_pts.as_slice()),
+    ];
+    frame.render_widget(line_chart(&series, 100.0, pct_labels()), rows[0]);
+
+    let vram_pct = pct(g.mem_used, g.mem_total);
+    frame.render_widget(
+        Gauge::default()
+            .ratio((vram_pct / 100.0) as f64)
+            .gauge_style(Style::new().fg(usage_color(vram_pct)))
+            .label(format!(
+                "VRAM {}/{} {:.0}%",
+                fmt_bytes(g.mem_used),
+                fmt_bytes(g.mem_total),
+                vram_pct
+            )),
+        rows[1],
+    );
+
+    frame.render_widget(Paragraph::new(gpu_telemetry_line(g)), rows[2]);
+    render_gpu_procs(frame, rows[3], g, gpu_procs, name_of);
+}
+
+/// One-line telemetry summary for a GPU band: util / temp / power / clocks /
+/// fan / enc / dec / PCIe. A missing-telemetry reason (note / suspended) takes
+/// over the whole line so 0s aren't shown as real readings.
+fn gpu_telemetry_line(g: &GpuSnapshot) -> Line<'static> {
+    if let Some(note) = &g.note {
+        return Line::from(Span::styled(
+            format!("⚠ {note}"),
+            Style::new().fg(Color::Yellow),
+        ));
+    }
+    if g.suspended {
+        return Line::from(Span::styled(
+            "⏾ idle (suspended)",
+            Style::new().fg(Color::DarkGray),
+        ));
+    }
+    let mut spans = vec![Span::styled(
+        format!("{:>3.0}% util", g.busy_pct),
+        Style::new().fg(usage_color(g.busy_pct)),
+    )];
+    if let Some(t) = g.temp_c {
+        spans.push(Span::raw(format!("  {t:.0}°C")));
+    }
+    if let Some(p) = g.power_w {
+        spans.push(Span::raw(format!("  {p:.0}W")));
+    }
+    if let Some(s) = g.sclk_mhz {
+        spans.push(Span::raw(format!("  core {s}MHz")));
+    }
+    if let Some(m) = g.mclk_mhz {
+        spans.push(Span::raw(format!("  mem {m}MHz")));
+    }
+    match g.fan {
+        Some(Fan::Pct(p)) => spans.push(Span::raw(format!("  fan {p:.0}%"))),
+        Some(Fan::Rpm(r)) => spans.push(Span::raw(format!("  fan {r}rpm"))),
+        None => {}
+    }
+    // enc/dec: NVIDIA reports values; AMD has none (—).
+    let fmt = |v: Option<f32>| v.map(|x| format!("{x:.0}%")).unwrap_or_else(|| "—".into());
+    spans.push(Span::styled(
+        format!("  enc {} dec {}", fmt(g.enc_pct), fmt(g.dec_pct)),
+        Style::new().fg(Color::DarkGray),
+    ));
+    if let Some(w) = g.pcie_width {
+        spans.push(Span::styled(
+            format!("  PCIe x{w}"),
+            Style::new().add_modifier(Modifier::DIM),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// The selected GPU band's process list: PID / GPU% / VRAM / COMMAND.
+fn render_gpu_procs(
+    frame: &mut Frame,
+    area: Rect,
+    g: &GpuSnapshot,
+    gpu_procs: Option<&HashMap<i32, GpuProcUse>>,
+    name_of: &HashMap<i32, String>,
+) {
+    if area.height == 0 {
+        return;
+    }
+    let tag = gpu_tag(g);
+    let rows = gpu_procs
+        .map(|m| procs_for_gpu(&tag, m, name_of))
+        .unwrap_or_default();
+
+    let cmd_w = (area.width as usize).saturating_sub(24).max(4);
+    let mut lines = vec![Line::from(Span::styled(
+        format!("  {:>6} {:>5} {:>7}  {}", "PID", "GPU%", "VRAM", "COMMAND"),
+        Style::new().add_modifier(Modifier::DIM),
+    ))];
+    if rows.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  (no GPU processes visible — other users need root/CAP_SYS_PTRACE)",
+            Style::new().add_modifier(Modifier::DIM),
+        )));
+    }
+    let max = (area.height as usize).saturating_sub(1);
+    for (pid, util, vram, name) in rows.iter().take(max) {
+        lines.push(Line::from(format!(
+            "  {:>6} {:>4.0}% {:>7}  {}",
+            pid,
+            util,
+            fmt_bytes(*vram),
+            truncate(name, cmd_w)
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 /// A single- or dual-series Braille line chart over the given owned point sets.
@@ -1166,7 +1388,9 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{CoreGroup, GpuProcUse, History, ProcInfo, SharedState, Stamped};
+    use crate::model::{
+        CoreGroup, GpuProcUse, GpuSnapshot, GpuVendor, History, ProcInfo, SharedState, Stamped,
+    };
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use std::collections::HashMap;
@@ -1391,5 +1615,100 @@ mod tests {
         let text = render_to_text(&synth(groups, 4), 90, 14);
         eprintln!("---- single socket ----\n{text}");
         assert!(!text.contains("S0"), "single socket should not be labelled");
+    }
+
+    /// Minimal GPU snapshot for tab-render tests.
+    fn gpu_snap(vendor: GpuVendor, index: usize, name: &str) -> GpuSnapshot {
+        GpuSnapshot {
+            vendor,
+            index,
+            name: name.into(),
+            busy_pct: 50.0,
+            util_hist: History::new(),
+            mem_used: 1 << 30,
+            mem_total: 8 << 30,
+            gtt: None,
+            vram_hist: History::new(),
+            temp_c: Some(60.0),
+            power_w: Some(100.0),
+            sclk_mhz: Some(1800),
+            mclk_mhz: Some(7000),
+            fan: Some(Fan::Pct(45.0)),
+            pcie_rx_bps: None,
+            pcie_tx_bps: None,
+            pcie_width: Some(16),
+            enc_pct: None,
+            dec_pct: None,
+            suspended: false,
+            note: None,
+        }
+    }
+
+    #[test]
+    fn procs_for_gpu_filters_by_tag() {
+        let mut gp: HashMap<i32, GpuProcUse> = HashMap::new();
+        gp.insert(
+            10,
+            GpuProcUse {
+                vram: 1000,
+                util_pct: 30.0,
+                label: "N0".into(),
+            },
+        );
+        gp.insert(
+            11,
+            GpuProcUse {
+                vram: 2000,
+                util_pct: 60.0,
+                label: "N0,A1".into(),
+            },
+        );
+        gp.insert(
+            12,
+            GpuProcUse {
+                vram: 500,
+                util_pct: 99.0,
+                label: "N1".into(), // different GPU, must be excluded
+            },
+        );
+        gp.insert(
+            13,
+            GpuProcUse {
+                vram: 9000,
+                util_pct: 5.0,
+                label: "A1".into(),
+            },
+        );
+        let mut names: HashMap<i32, String> = HashMap::new();
+        names.insert(10, "ten".into());
+        names.insert(11, "eleven".into());
+
+        let rows = procs_for_gpu("N0", &gp, &names);
+        let pids: Vec<i32> = rows.iter().map(|r| r.0).collect();
+        // Only the two N0 procs, GPU% descending (60 before 30).
+        assert_eq!(pids, vec![11, 10]);
+        assert_eq!(rows[0].3, "eleven");
+        // Missing name falls back to empty, not a panic.
+        assert!(procs_for_gpu("A1", &gp, &names).iter().any(|r| r.0 == 13));
+    }
+
+    #[test]
+    fn gpu_tab_renders_both_vendors() {
+        let state = SharedState::default();
+        state.nvidia.store(Some(std::sync::Arc::new(Stamped::new(vec![
+            gpu_snap(GpuVendor::Nvidia, 0, "RTX_TEST"),
+        ]))));
+        state.amd.store(Some(std::sync::Arc::new(Stamped::new(vec![gpu_snap(
+            GpuVendor::Amd,
+            0,
+            "RADEON_TEST",
+        )]))));
+        let view = View {
+            tab: Tab::Gpu,
+            ..View::default()
+        };
+        let text = full_to_text(&state, &view, 90, 24);
+        assert!(text.contains("RTX_TEST"), "nvidia band missing:\n{text}");
+        assert!(text.contains("RADEON_TEST"), "amd band missing:\n{text}");
     }
 }

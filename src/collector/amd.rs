@@ -120,6 +120,9 @@ impl Collector for AmdCollector {
                 pcie_rx_bps: None,
                 pcie_tx_bps: None,
                 pcie_width: m.and_then(|m| m.pcie_width),
+                // amdgpu doesn't expose VCN enc/dec engine util via sysfs.
+                enc_pct: None,
+                dec_pct: None,
                 suspended,
                 note,
             });
