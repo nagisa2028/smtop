@@ -16,7 +16,10 @@ use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Axis, Block, Chart, Dataset, Gauge, GraphType, Paragraph};
 
-use crate::model::{CoreGroup, CpuSnapshot, DiskSnapshot, Fan, FsSnapshot, GpuSnapshot, GpuVendor, NetSnapshot, ProcInfo, SharedState};
+use crate::model::{
+    CoreGroup, CpuSnapshot, DiskSnapshot, Fan, FsSnapshot, GpuSnapshot, GpuVendor, NetSnapshot,
+    ProcInfo, SharedState,
+};
 use widgets::{fmt_bytes, fmt_link, fmt_rate, fmt_uptime, hbar, usage_color};
 
 const FRAME_MS: u64 = 250;
@@ -145,7 +148,10 @@ fn run_loop(terminal: &mut DefaultTerminal, state: &SharedState) -> io::Result<(
                         KeyCode::Char('G') if in_procs => set_sort(&mut view, ProcSort::GpuVram),
                         KeyCode::Char('p') if in_procs => set_sort(&mut view, ProcSort::Pid),
                         KeyCode::Down | KeyCode::Char('j') if in_procs => {
-                            view.proc_scroll += 1;
+                            // Clamp so overshooting the end doesn't accumulate
+                            // presses that ↑ would have to undo one by one.
+                            let count = state.procs.load_full().map_or(0, |p| p.len());
+                            view.proc_scroll = (view.proc_scroll + 1).min(count.saturating_sub(1));
                         }
                         KeyCode::Up | KeyCode::Char('k') if in_procs => {
                             view.proc_scroll = view.proc_scroll.saturating_sub(1);
@@ -163,7 +169,8 @@ fn run_loop(terminal: &mut DefaultTerminal, state: &SharedState) -> io::Result<(
 fn render(frame: &mut Frame, state: &SharedState, view: &View) {
     let full = frame.area();
     if full.width < 50 || full.height < 18 {
-        let p = Paragraph::new("terminal too small — resize (≥50×18)").style(Style::new().fg(Color::Yellow));
+        let p = Paragraph::new("terminal too small — resize (≥50×18)")
+            .style(Style::new().fg(Color::Yellow));
         frame.render_widget(p, full);
         return;
     }
@@ -217,9 +224,9 @@ fn render_overview(frame: &mut Frame, area: Rect, state: &SharedState) {
     render_bottom(
         frame,
         tiers[2],
-        net.as_deref().map(Vec::as_slice).unwrap_or(&[]),
-        disk.as_deref().map(Vec::as_slice).unwrap_or(&[]),
-        fs.as_deref().map(Vec::as_slice).unwrap_or(&[]),
+        net.as_deref().map(|v| v.as_slice()).unwrap_or(&[]),
+        disk.as_deref().map(|v| v.as_slice()).unwrap_or(&[]),
+        fs.as_deref().map(|v| v.as_slice()).unwrap_or(&[]),
     );
 }
 
@@ -243,7 +250,9 @@ fn line_chart<'a>(
         .collect();
     let mut y_axis = Axis::default().bounds([0.0, y_max.max(1.0)]);
     if !y_labels.is_empty() {
-        y_axis = y_axis.labels(y_labels).style(Style::new().fg(Color::DarkGray));
+        y_axis = y_axis
+            .labels(y_labels)
+            .style(Style::new().fg(Color::DarkGray));
     }
     // Fixed window so the newest sample stays pinned to the right edge and the
     // graph scrolls right-to-left, rather than rescaling as history fills.
@@ -262,7 +271,12 @@ const TH_W: usize = 3;
 
 /// Digits reserved for the cpu-index label (aligns 1/2/3-digit indices).
 fn cpu_label_width(groups: &[CoreGroup]) -> usize {
-    let max_cpu = groups.iter().flat_map(|g| g.cpus.iter()).copied().max().unwrap_or(0);
+    let max_cpu = groups
+        .iter()
+        .flat_map(|g| g.cpus.iter())
+        .copied()
+        .max()
+        .unwrap_or(0);
     if max_cpu >= 100 {
         3
     } else if max_cpu >= 10 {
@@ -279,7 +293,9 @@ fn core_cell_w(threads: usize, lw: usize) -> usize {
 
 /// True when more than one socket (package) is present.
 fn multi_socket(groups: &[CoreGroup]) -> bool {
-    groups.first().is_some_and(|f| groups.iter().any(|g| g.package != f.package))
+    groups
+        .first()
+        .is_some_and(|f| groups.iter().any(|g| g.package != f.package))
 }
 
 /// Text rows the per-core grid needs: each socket starts a new row (prefixed
@@ -332,7 +348,10 @@ fn render_header(frame: &mut Frame, area: Rect, state: &SharedState, view: &View
         Span::styled("mon", Style::new().fg(Color::Cyan).bold()),
         Span::raw(" "),
         Span::styled(hostname(), Style::new().fg(Color::White)),
-        Span::styled(format!("  {now}  "), Style::new().add_modifier(Modifier::DIM)),
+        Span::styled(
+            format!("  {now}  "),
+            Style::new().add_modifier(Modifier::DIM),
+        ),
     ];
     // Tab bar: selected tab reversed, others dim.
     for (i, (tab, title)) in [(Tab::Overview, "Overview"), (Tab::Processes, "Processes")]
@@ -348,26 +367,40 @@ fn render_header(frame: &mut Frame, area: Rect, state: &SharedState, view: &View
         spans.push(Span::styled(format!(" {}:{title} ", i + 1), style));
         spans.push(Span::raw(" "));
     }
-    // Liveness: green once a collector has published, red if it never has.
+    // Liveness by freshness: green = recently published, yellow = published
+    // but stale (the collector stopped updating — e.g. a driver died — so the
+    // data on screen is frozen), red = never published.
+    let base = crate::collector::sample_interval();
+    let gpu_at = [state.nvidia.load_full(), state.amd.load_full()]
+        .into_iter()
+        .flatten()
+        .map(|s| s.at)
+        .max();
     spans.push(Span::raw(" "));
-    for (label, alive) in [
-        ("cpu", state.cpu.load_full().is_some()),
-        ("gpu", state.nvidia.load_full().is_some() || state.amd.load_full().is_some()),
-        ("net", state.net.load_full().is_some()),
-        ("disk", state.disk.load_full().is_some()),
-        ("fs", state.fs.load_full().is_some()),
+    for (label, at, mult) in [
+        ("cpu", state.cpu.load_full().map(|s| s.at), 3u32),
+        ("gpu", gpu_at, 3),
+        ("net", state.net.load_full().map(|s| s.at), 3),
+        ("disk", state.disk.load_full().map(|s| s.at), 3),
+        // fs samples every 5 intervals, so its stale threshold scales too.
+        ("fs", state.fs.load_full().map(|s| s.at), 15),
     ] {
-        spans.push(Span::styled(
-            format!("{label} "),
-            Style::new().fg(if alive { Color::Green } else { Color::Red }),
-        ));
+        let color = match at {
+            Some(t) if t.elapsed() <= base * mult => Color::Green,
+            Some(_) => Color::Yellow,
+            None => Color::Red,
+        };
+        spans.push(Span::styled(format!("{label} "), Style::new().fg(color)));
     }
     if view.paused {
-        spans.push(Span::styled(" PAUSED ", Style::new().fg(Color::Black).bg(Color::Yellow)));
+        spans.push(Span::styled(
+            " PAUSED ",
+            Style::new().fg(Color::Black).bg(Color::Yellow),
+        ));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
     let hints = if view.tab == Tab::Processes {
-        "Tab/1/2:tabs  c/m/d/g:sort  r:reverse  ↑↓:scroll  q:quit"
+        "Tab/1/2:tabs  c/m/d/D/g/G/p:sort  r:reverse  ↑↓:scroll  q:quit"
     } else {
         "Tab/1/2:tabs  space:pause  q:quit"
     };
@@ -430,7 +463,9 @@ fn render_processes(frame: &mut Frame, area: Rect, state: &SharedState, view: &V
     // Fixed columns: PID(7) CPU(5) MEM(9) DISK_R(8) DISK_W(8) GPU(9) VRAM(8) S(1).
     let cmd_w = (inner.width as usize).saturating_sub(63).max(4);
     let base = Style::new().add_modifier(Modifier::REVERSED);
-    let active = Style::new().fg(Color::Yellow).add_modifier(Modifier::REVERSED | Modifier::BOLD);
+    let active = Style::new()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::REVERSED | Modifier::BOLD);
     let col = |text: String, this: ProcSort| {
         Span::styled(text, if view.proc_sort == this { active } else { base })
     };
@@ -442,19 +477,40 @@ fn render_processes(frame: &mut Frame, area: Rect, state: &SharedState, view: &V
         }
     };
     let header = Line::from(vec![
-        col(format!("{:>6}{}", "PID", mark(ProcSort::Pid)), ProcSort::Pid),
+        col(
+            format!("{:>6}{}", "PID", mark(ProcSort::Pid)),
+            ProcSort::Pid,
+        ),
         Span::styled(" ", base),
-        col(format!("{:>4}{}", "CPU%", mark(ProcSort::Cpu)), ProcSort::Cpu),
+        col(
+            format!("{:>4}{}", "CPU%", mark(ProcSort::Cpu)),
+            ProcSort::Cpu,
+        ),
         Span::styled(" ", base),
-        col(format!("{:>8}{}", "MEM", mark(ProcSort::Mem)), ProcSort::Mem),
+        col(
+            format!("{:>8}{}", "MEM", mark(ProcSort::Mem)),
+            ProcSort::Mem,
+        ),
         Span::styled(" ", base),
-        col(format!("{:>7}{}", "DISK R", mark(ProcSort::DiskRead)), ProcSort::DiskRead),
+        col(
+            format!("{:>7}{}", "DISK R", mark(ProcSort::DiskRead)),
+            ProcSort::DiskRead,
+        ),
         Span::styled(" ", base),
-        col(format!("{:>7}{}", "DISK W", mark(ProcSort::DiskWrite)), ProcSort::DiskWrite),
+        col(
+            format!("{:>7}{}", "DISK W", mark(ProcSort::DiskWrite)),
+            ProcSort::DiskWrite,
+        ),
         Span::styled(" ", base),
-        col(format!("{:>8}{}", "GPU", mark(ProcSort::GpuPct)), ProcSort::GpuPct),
+        col(
+            format!("{:>8}{}", "GPU", mark(ProcSort::GpuPct)),
+            ProcSort::GpuPct,
+        ),
         Span::styled(" ", base),
-        col(format!("{:>7}{}", "VRAM", mark(ProcSort::GpuVram)), ProcSort::GpuVram),
+        col(
+            format!("{:>7}{}", "VRAM", mark(ProcSort::GpuVram)),
+            ProcSort::GpuVram,
+        ),
         Span::styled(" S ", base),
         Span::styled(format!("{:<cmd_w$}", "COMMAND"), base),
     ]);
@@ -497,7 +553,10 @@ fn render_processes(frame: &mut Frame, area: Rect, state: &SharedState, view: &V
             Span::raw(format!("{:>9} ", fmt_bytes(p.rss))),
             disk_cell(p.disk_read_bps, p.io_ok, Color::Cyan),
             disk_cell(p.disk_write_bps, p.io_ok, Color::Magenta),
-            Span::styled(format!("{gpu_text:>9} "), Style::new().fg(usage_color(gpu_util_val.min(100.0)))),
+            Span::styled(
+                format!("{gpu_text:>9} "),
+                Style::new().fg(usage_color(gpu_util_val.min(100.0))),
+            ),
             Span::styled(format!("{vram_text:>8} "), Style::new().fg(Color::Blue)),
             Span::styled(format!("{} ", p.state), proc_state_style(p.state)),
             Span::styled(name, Style::new().add_modifier(Modifier::DIM)),
@@ -535,9 +594,12 @@ fn render_cpu(frame: &mut Frame, area: Rect, cpu: &CpuSnapshot) {
     // Usage time-series.
     let pts = cpu.usage_hist.points();
     let mem_pts = cpu.mem_hist.points();
-    let series = [(Color::Cyan, pts.as_slice()), (Color::Magenta, mem_pts.as_slice())];
-    let chart = line_chart(&series, 100.0, pct_labels())
-        .block(Block::bordered().title(Line::from(vec![
+    let series = [
+        (Color::Cyan, pts.as_slice()),
+        (Color::Magenta, mem_pts.as_slice()),
+    ];
+    let chart =
+        line_chart(&series, 100.0, pct_labels()).block(Block::bordered().title(Line::from(vec![
             Span::styled("usage", Style::new().fg(Color::Cyan)),
             Span::raw(" / "),
             Span::styled("mem %", Style::new().fg(Color::Magenta)),
@@ -557,7 +619,11 @@ fn render_cpu(frame: &mut Frame, area: Rect, cpu: &CpuSnapshot) {
         Gauge::default()
             .ratio((mem_pct / 100.0) as f64)
             .gauge_style(Style::new().fg(usage_color(mem_pct)))
-            .label(format!("RAM {}/{}", fmt_bytes(cpu.mem_used), fmt_bytes(cpu.mem_total))),
+            .label(format!(
+                "RAM {}/{}",
+                fmt_bytes(cpu.mem_used),
+                fmt_bytes(cpu.mem_total)
+            )),
         g[0],
     );
     if cpu.swap_total > 0 {
@@ -566,7 +632,11 @@ fn render_cpu(frame: &mut Frame, area: Rect, cpu: &CpuSnapshot) {
             Gauge::default()
                 .ratio((sp / 100.0) as f64)
                 .gauge_style(Style::new().fg(usage_color(sp)))
-                .label(format!("Swap {}/{}", fmt_bytes(cpu.swap_used), fmt_bytes(cpu.swap_total))),
+                .label(format!(
+                    "Swap {}/{}",
+                    fmt_bytes(cpu.swap_used),
+                    fmt_bytes(cpu.swap_total)
+                )),
             g[1],
         );
     } else {
@@ -585,7 +655,10 @@ fn render_cpu(frame: &mut Frame, area: Rect, cpu: &CpuSnapshot) {
     );
     let mut info = vec![
         Span::raw("CPU "),
-        Span::styled(format!("{:>3.0}%", cpu.usage), Style::new().fg(usage_color(cpu.usage))),
+        Span::styled(
+            format!("{:>3.0}%", cpu.usage),
+            Style::new().fg(usage_color(cpu.usage)),
+        ),
     ];
     if let Some(f) = cpu.freq_mhz {
         info.push(Span::raw(format!("  {:.2}GHz", f / 1000.0)));
@@ -638,7 +711,10 @@ fn render_cpu(frame: &mut Frame, area: Rect, cpu: &CpuSnapshot) {
                 spans.push(Span::styled("│", thread_sep));
             }
             let u = cpu.per_core.get(lcpu).copied().unwrap_or(0.0);
-            spans.push(Span::styled(format!("{lcpu:>lw$}"), Style::new().add_modifier(Modifier::DIM)));
+            spans.push(Span::styled(
+                format!("{lcpu:>lw$}"),
+                Style::new().add_modifier(Modifier::DIM),
+            ));
             spans.push(Span::styled(hbar(u, TH_W), Style::new().fg(usage_color(u))));
         }
         cur_w += cw;
@@ -700,7 +776,10 @@ fn render_gpu_card(frame: &mut Frame, area: Rect, g: &GpuSnapshot) {
 
     let pts = g.util_hist.points();
     let vram_pts = g.vram_hist.points();
-    let series = [(usage_color(g.busy_pct), pts.as_slice()), (Color::Blue, vram_pts.as_slice())];
+    let series = [
+        (usage_color(g.busy_pct), pts.as_slice()),
+        (Color::Blue, vram_pts.as_slice()),
+    ];
     frame.render_widget(line_chart(&series, 100.0, pct_labels()), rows[0]);
 
     let vram_pct = pct(g.mem_used, g.mem_total);
@@ -719,9 +798,15 @@ fn render_gpu_card(frame: &mut Frame, area: Rect, g: &GpuSnapshot) {
 
     let mut stats: Vec<Span> = if let Some(note) = &g.note {
         // Telemetry is missing for an explained reason — show it instead of 0%.
-        vec![Span::styled(format!("⚠ {note}"), Style::new().fg(Color::Yellow))]
+        vec![Span::styled(
+            format!("⚠ {note}"),
+            Style::new().fg(Color::Yellow),
+        )]
     } else if g.suspended {
-        vec![Span::styled("⏾ idle (suspended)", Style::new().fg(Color::DarkGray))]
+        vec![Span::styled(
+            "⏾ idle (suspended)",
+            Style::new().fg(Color::DarkGray),
+        )]
     } else {
         vec![Span::styled(
             format!("{:>3.0}% util", g.busy_pct),
@@ -779,9 +864,19 @@ fn render_bottom(
     fs: &[FsSnapshot],
 ) {
     let chunks = if area.width >= 84 {
-        Layout::horizontal([Constraint::Fill(1), Constraint::Fill(1), Constraint::Fill(1)]).split(area)
+        Layout::horizontal([
+            Constraint::Fill(1),
+            Constraint::Fill(1),
+            Constraint::Fill(1),
+        ])
+        .split(area)
     } else {
-        Layout::vertical([Constraint::Fill(1), Constraint::Fill(1), Constraint::Fill(1)]).split(area)
+        Layout::vertical([
+            Constraint::Fill(1),
+            Constraint::Fill(1),
+            Constraint::Fill(1),
+        ])
+        .split(area)
     };
     render_net(frame, chunks[0], net);
     render_disk(frame, chunks[1], disk);
@@ -803,26 +898,47 @@ fn render_net(frame: &mut Frame, area: Rect, net: &[NetSnapshot]) {
         .take(3)
         .map(|n| {
             let link = match (n.up, n.speed_mbps) {
-                (true, Some(s)) => Span::styled(format!(" {}", fmt_link(s)), Style::new().fg(Color::DarkGray)),
+                (true, Some(s)) => Span::styled(
+                    format!(" {}", fmt_link(s)),
+                    Style::new().fg(Color::DarkGray),
+                ),
                 (true, None) => Span::styled(" up", Style::new().fg(Color::DarkGray)),
                 (false, _) => Span::styled(" down", Style::new().fg(Color::Red)),
             };
             Line::from(vec![
                 Span::raw(format!("{:<8}", truncate(&n.iface, 8))),
-                Span::styled(format!("▼{:>8}", fmt_rate(n.rx_bps)), Style::new().fg(Color::Green)),
-                Span::styled(format!(" ▲{:>8}", fmt_rate(n.tx_bps)), Style::new().fg(Color::Blue)),
+                Span::styled(
+                    format!("▼{:>8}", fmt_rate(n.rx_bps)),
+                    Style::new().fg(Color::Green),
+                ),
+                Span::styled(
+                    format!(" ▲{:>8}", fmt_rate(n.tx_bps)),
+                    Style::new().fg(Color::Blue),
+                ),
                 link,
             ])
         })
         .collect();
     frame.render_widget(Paragraph::new(lines), parts[0]);
 
-    if let Some(top) = net.first() {
+    // Chart the interface with the largest activity *over the window*, not the
+    // largest instantaneous rate: otherwise when a busy iface goes idle the
+    // selection flips to some other (idle) iface and the graph collapses to
+    // zero, hiding the spike that's still in the history.
+    if let Some(top) = net.iter().max_by(|a, b| {
+        let am = a.rx_hist.max().max(a.tx_hist.max());
+        let bm = b.rx_hist.max().max(b.tx_hist.max());
+        am.partial_cmp(&bm).unwrap_or(std::cmp::Ordering::Equal)
+    }) {
         let rx = top.rx_hist.points();
         let tx = top.tx_hist.points();
         let ymax = top.rx_hist.max().max(top.tx_hist.max());
         frame.render_widget(
-            line_chart(&[(Color::Green, &rx), (Color::Blue, &tx)], ymax, rate_labels(ymax)),
+            line_chart(
+                &[(Color::Green, &rx), (Color::Blue, &tx)],
+                ymax,
+                rate_labels(ymax),
+            ),
             parts[1],
         );
     }
@@ -847,19 +963,31 @@ fn render_disk(frame: &mut Frame, area: Rect, disk: &[DiskSnapshot]) {
         .map(|d| {
             Line::from(vec![
                 Span::raw(format!("{:<7}", truncate(&d.dev, 7))),
-                Span::styled(format!("{:>3.0}%", d.util_pct), Style::new().fg(usage_color(d.util_pct))),
-                Span::styled(format!(" R{:>8}", fmt_rate(d.r_bps)), Style::new().fg(Color::Cyan)),
-                Span::styled(format!(" W{:>8}", fmt_rate(d.w_bps)), Style::new().fg(Color::Magenta)),
+                Span::styled(
+                    format!("{:>3.0}%", d.util_pct),
+                    Style::new().fg(usage_color(d.util_pct)),
+                ),
+                Span::styled(
+                    format!(" R{:>8}", fmt_rate(d.r_bps)),
+                    Style::new().fg(Color::Cyan),
+                ),
+                Span::styled(
+                    format!(" W{:>8}", fmt_rate(d.w_bps)),
+                    Style::new().fg(Color::Magenta),
+                ),
             ])
         })
         .collect();
     frame.render_widget(Paragraph::new(lines), parts[0]);
 
-    // Busiest device by recent activity.
+    // Chart the device with the largest activity *over the window*, not the
+    // largest instantaneous rate: otherwise when a busy device goes idle the
+    // selection flips to some other (idle) device and the graph collapses to
+    // zero, hiding the spike that's still in the history.
     if let Some(top) = disk.iter().max_by(|a, b| {
-        (a.r_bps + a.w_bps)
-            .partial_cmp(&(b.r_bps + b.w_bps))
-            .unwrap_or(std::cmp::Ordering::Equal)
+        let am = a.r_hist.max().max(a.w_hist.max());
+        let bm = b.r_hist.max().max(b.w_hist.max());
+        am.partial_cmp(&bm).unwrap_or(std::cmp::Ordering::Equal)
     }) {
         let r = top.r_hist.points();
         let w = top.w_hist.points();
@@ -869,8 +997,12 @@ fn render_disk(frame: &mut Frame, area: Rect, disk: &[DiskSnapshot]) {
             Style::new().add_modifier(Modifier::DIM),
         ));
         frame.render_widget(
-            line_chart(&[(Color::Cyan, &r), (Color::Magenta, &w)], ymax, rate_labels(ymax))
-                .block(Block::default().title(iops_title)),
+            line_chart(
+                &[(Color::Cyan, &r), (Color::Magenta, &w)],
+                ymax,
+                rate_labels(ymax),
+            )
+            .block(Block::default().title(iops_title)),
             parts[1],
         );
     }
@@ -941,7 +1073,14 @@ fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
     } else {
-        let keep: String = s.chars().rev().take(max - 1).collect::<Vec<_>>().into_iter().rev().collect();
+        let keep: String = s
+            .chars()
+            .rev()
+            .take(max - 1)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
         format!("…{keep}")
     }
 }
@@ -949,7 +1088,7 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{CoreGroup, GpuProcUse, History, ProcInfo, SharedState};
+    use crate::model::{CoreGroup, GpuProcUse, History, ProcInfo, SharedState, Stamped};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use std::collections::HashMap;
@@ -971,52 +1110,109 @@ mod tests {
     #[test]
     fn processes_tab_sorts_by_selected_key() {
         let state = SharedState::default();
-        state.procs.store(Some(std::sync::Arc::new(vec![
-            ProcInfo { pid: 1, name: "AAA_high_cpu".into(), cpu_pct: 99.0, rss: 10 << 20, state: 'R', disk_read_bps: 0.0, disk_write_bps: 7e6, io_ok: true },
-            ProcInfo { pid: 2, name: "BBB_high_mem".into(), cpu_pct: 1.0, rss: 900 << 20, state: 'S', disk_read_bps: 5e6, disk_write_bps: 0.0, io_ok: true },
-        ])));
+        state
+            .procs
+            .store(Some(std::sync::Arc::new(Stamped::new(vec![
+                ProcInfo {
+                    pid: 1,
+                    name: "AAA_high_cpu".into(),
+                    cpu_pct: 99.0,
+                    rss: 10 << 20,
+                    state: 'R',
+                    disk_read_bps: 0.0,
+                    disk_write_bps: 7e6,
+                    io_ok: true,
+                },
+                ProcInfo {
+                    pid: 2,
+                    name: "BBB_high_mem".into(),
+                    cpu_pct: 1.0,
+                    rss: 900 << 20,
+                    state: 'S',
+                    disk_read_bps: 5e6,
+                    disk_write_bps: 0.0,
+                    io_ok: true,
+                },
+            ]))));
         // pid 2 hogs GPU (VRAM + util); pid 1 uses none.
-        state.gpu_procs.store(Some(std::sync::Arc::new(HashMap::from([
-            (2, GpuProcUse { vram: 2 << 30, util_pct: 80.0, label: "N0".into() }),
-        ]))));
+        state
+            .gpu_procs
+            .store(Some(std::sync::Arc::new(Stamped::new(HashMap::from([(
+                2,
+                GpuProcUse {
+                    vram: 2 << 30,
+                    util_pct: 80.0,
+                    label: "N0".into(),
+                },
+            )])))));
         let pos = |t: &str, needle: &str| t.lines().position(|l| l.contains(needle));
 
-        let mut view = View { tab: Tab::Processes, paused: false, proc_scroll: 0, proc_sort: ProcSort::Cpu, proc_rev: false };
+        let mut view = View {
+            tab: Tab::Processes,
+            paused: false,
+            proc_scroll: 0,
+            proc_sort: ProcSort::Cpu,
+            proc_rev: false,
+        };
         let t = full_to_text(&state, &view, 80, 20);
-        assert!(pos(&t, "AAA_high_cpu") < pos(&t, "BBB_high_mem"), "CPU sort order wrong");
+        assert!(
+            pos(&t, "AAA_high_cpu") < pos(&t, "BBB_high_mem"),
+            "CPU sort order wrong"
+        );
 
         // Reverse flips the order.
         view.proc_rev = true;
         let t = full_to_text(&state, &view, 80, 20);
-        assert!(pos(&t, "BBB_high_mem") < pos(&t, "AAA_high_cpu"), "reverse CPU sort wrong");
+        assert!(
+            pos(&t, "BBB_high_mem") < pos(&t, "AAA_high_cpu"),
+            "reverse CPU sort wrong"
+        );
         view.proc_rev = false;
 
         view.proc_sort = ProcSort::Mem;
         let t = full_to_text(&state, &view, 80, 20);
-        assert!(pos(&t, "BBB_high_mem") < pos(&t, "AAA_high_cpu"), "MEM sort order wrong");
+        assert!(
+            pos(&t, "BBB_high_mem") < pos(&t, "AAA_high_cpu"),
+            "MEM sort order wrong"
+        );
 
         view.proc_sort = ProcSort::Pid;
         let t = full_to_text(&state, &view, 80, 20);
-        assert!(pos(&t, "AAA_high_cpu") < pos(&t, "BBB_high_mem"), "PID sort order wrong");
+        assert!(
+            pos(&t, "AAA_high_cpu") < pos(&t, "BBB_high_mem"),
+            "PID sort order wrong"
+        );
 
         // BBB reads, AAA writes → each disk sort surfaces a different process.
         view.proc_sort = ProcSort::DiskRead;
         let t = full_to_text(&state, &view, 90, 20);
-        assert!(pos(&t, "BBB_high_mem") < pos(&t, "AAA_high_cpu"), "DISK R sort order wrong");
+        assert!(
+            pos(&t, "BBB_high_mem") < pos(&t, "AAA_high_cpu"),
+            "DISK R sort order wrong"
+        );
 
         view.proc_sort = ProcSort::DiskWrite;
         let t = full_to_text(&state, &view, 90, 20);
-        assert!(pos(&t, "AAA_high_cpu") < pos(&t, "BBB_high_mem"), "DISK W sort order wrong");
+        assert!(
+            pos(&t, "AAA_high_cpu") < pos(&t, "BBB_high_mem"),
+            "DISK W sort order wrong"
+        );
 
         // pid 2 uses the GPU → first under GPU% and VRAM sorts.
         view.proc_sort = ProcSort::GpuPct;
         let t = full_to_text(&state, &view, 110, 20);
-        assert!(pos(&t, "BBB_high_mem") < pos(&t, "AAA_high_cpu"), "GPU% sort order wrong");
+        assert!(
+            pos(&t, "BBB_high_mem") < pos(&t, "AAA_high_cpu"),
+            "GPU% sort order wrong"
+        );
         assert!(t.contains("N0 80%"), "GPU cell missing");
 
         view.proc_sort = ProcSort::GpuVram;
         let t = full_to_text(&state, &view, 110, 20);
-        assert!(pos(&t, "BBB_high_mem") < pos(&t, "AAA_high_cpu"), "VRAM sort order wrong");
+        assert!(
+            pos(&t, "BBB_high_mem") < pos(&t, "AAA_high_cpu"),
+            "VRAM sort order wrong"
+        );
     }
 
     fn synth(core_groups: Vec<CoreGroup>, ncpu: usize) -> CpuSnapshot {
@@ -1060,10 +1256,22 @@ mod tests {
     fn dual_socket_has_labels_on_separate_rows() {
         // 2 sockets × 2 cores × 2 threads (cpu 0..8).
         let groups = vec![
-            CoreGroup { package: 0, cpus: vec![0, 1] },
-            CoreGroup { package: 0, cpus: vec![2, 3] },
-            CoreGroup { package: 1, cpus: vec![4, 5] },
-            CoreGroup { package: 1, cpus: vec![6, 7] },
+            CoreGroup {
+                package: 0,
+                cpus: vec![0, 1],
+            },
+            CoreGroup {
+                package: 0,
+                cpus: vec![2, 3],
+            },
+            CoreGroup {
+                package: 1,
+                cpus: vec![4, 5],
+            },
+            CoreGroup {
+                package: 1,
+                cpus: vec![6, 7],
+            },
         ];
         let text = render_to_text(&synth(groups, 8), 90, 14);
         eprintln!("---- dual socket ----\n{text}");
@@ -1071,14 +1279,24 @@ mod tests {
         assert!(text.contains("S1"), "missing S1 label");
         // S0 and S1 must be on different rows.
         let row_of = |needle: &str| text.lines().position(|l| l.contains(needle));
-        assert_ne!(row_of("S0"), row_of("S1"), "sockets should be on separate rows");
+        assert_ne!(
+            row_of("S0"),
+            row_of("S1"),
+            "sockets should be on separate rows"
+        );
     }
 
     #[test]
     fn single_socket_has_no_label() {
         let groups = vec![
-            CoreGroup { package: 0, cpus: vec![0, 1] },
-            CoreGroup { package: 0, cpus: vec![2, 3] },
+            CoreGroup {
+                package: 0,
+                cpus: vec![0, 1],
+            },
+            CoreGroup {
+                package: 0,
+                cpus: vec![2, 3],
+            },
         ];
         let text = render_to_text(&synth(groups, 4), 90, 14);
         eprintln!("---- single socket ----\n{text}");

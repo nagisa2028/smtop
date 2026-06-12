@@ -106,7 +106,10 @@ impl Collector for NetCollector {
 /// Per-iface columns after the colon: 0 rx_bytes … 8 tx_bytes.
 fn parse_netdev_line(line: &str) -> Option<(String, u64, u64)> {
     let (iface, rest) = line.split_once(':')?;
-    let cols: Vec<u64> = rest.split_whitespace().map(|v| v.parse().unwrap_or(0)).collect();
+    let cols: Vec<u64> = rest
+        .split_whitespace()
+        .map(|v| v.parse().unwrap_or(0))
+        .collect();
     if cols.len() < 9 {
         return None;
     }

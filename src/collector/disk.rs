@@ -71,9 +71,12 @@ impl Collector for DiskCollector {
             let prev = self.prev.entry(name.to_string()).or_default();
             let (r_bps, w_bps, util_pct, r_iops, w_iops) = match dt {
                 Some(dt) if dt > 0.0 => (
-                    read_sectors.saturating_sub(prev.read_sectors) as f64 * SECTOR_BYTES as f64 / dt,
-                    write_sectors.saturating_sub(prev.write_sectors) as f64 * SECTOR_BYTES as f64 / dt,
-                    (io_ticks.saturating_sub(prev.io_ticks) as f64 / (dt * 1000.0) * 100.0).min(100.0) as f32,
+                    read_sectors.saturating_sub(prev.read_sectors) as f64 * SECTOR_BYTES as f64
+                        / dt,
+                    write_sectors.saturating_sub(prev.write_sectors) as f64 * SECTOR_BYTES as f64
+                        / dt,
+                    (io_ticks.saturating_sub(prev.io_ticks) as f64 / (dt * 1000.0) * 100.0)
+                        .min(100.0) as f32,
                     reads_done.saturating_sub(prev.reads_done) as f64 / dt,
                     writes_done.saturating_sub(prev.writes_done) as f64 / dt,
                 ),
@@ -117,8 +120,12 @@ fn is_physical(name: &str) -> bool {
         return false;
     }
     // nvme0n1 = disk, nvme0n1p1 = partition
-    if name.starts_with("nvme") || name.starts_with("mmcblk") {
+    if name.starts_with("nvme") {
         return !name.contains('p');
+    }
+    // mmcblk0 = disk; mmcblk0p1 / mmcblk0boot0 / mmcblk0rpmb are not.
+    if let Some(rest) = name.strip_prefix("mmcblk") {
+        return !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit());
     }
     // sda = disk, sda1 = partition
     if name.starts_with("sd") || name.starts_with("vd") || name.starts_with("hd") {
@@ -185,5 +192,9 @@ mod tests {
         assert!(!is_physical("sda1"));
         assert!(!is_physical("loop0"));
         assert!(!is_physical("dm-0"));
+        assert!(is_physical("mmcblk0"));
+        assert!(!is_physical("mmcblk0p1"));
+        assert!(!is_physical("mmcblk0boot0"));
+        assert!(!is_physical("mmcblk0rpmb"));
     }
 }

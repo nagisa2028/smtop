@@ -31,11 +31,12 @@ pub fn init_logger(path: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-fn log_line(msg: &str) {
+pub(crate) fn log_line(msg: &str) {
     if let Some(lock) = LOGGER.get()
-        && let Ok(mut f) = lock.lock() {
-            let _ = writeln!(f, "{msg}");
-        }
+        && let Ok(mut f) = lock.lock()
+    {
+        let _ = writeln!(f, "{msg}");
+    }
 }
 
 pub mod amd;
@@ -44,9 +45,9 @@ pub mod disk;
 pub mod fs;
 pub mod gpuproc;
 pub mod net;
-pub mod proc;
 #[cfg(feature = "nvidia")]
 pub mod nvidia;
+pub mod proc;
 
 /// A periodic sampler. Implementations hold their own previous-sample state and
 /// history buffers across `sample` calls (via `&mut self`).

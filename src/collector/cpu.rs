@@ -14,12 +14,14 @@ struct CpuTimes {
 }
 
 impl CpuTimes {
-    /// Parse the fields after the `cpu`/`cpuN` label.
+    /// Parse the fields after the `cpu`/`cpuN` label. Any unparsable field
+    /// rejects the whole line — silently dropping one would shift the
+    /// position-dependent fields after it.
     fn parse(fields: &str) -> Option<Self> {
         let vals: Vec<u64> = fields
             .split_whitespace()
-            .filter_map(|f| f.parse().ok())
-            .collect();
+            .map(|f| f.parse().ok())
+            .collect::<Option<_>>()?;
         if vals.len() < 4 {
             return None;
         }
@@ -31,11 +33,13 @@ impl CpuTimes {
 
     fn usage_since(&self, prev: &Self) -> f32 {
         let dt = self.total.saturating_sub(prev.total);
+        // Saturate: a counter quirk (e.g. steal rewinding on VM migration) must
+        // not wrap into a huge busy delta.
         let di = self.idle.saturating_sub(prev.idle);
         if dt == 0 {
             0.0
         } else {
-            (100.0 * (dt - di) as f64 / dt as f64) as f32
+            (100.0 * dt.saturating_sub(di) as f64 / dt as f64) as f32
         }
     }
 }
@@ -113,13 +117,18 @@ impl Collector for CpuCollector {
         self.prev_cores = cores;
 
         let mem = read_mem();
-        let (mem_used, mem_total, swap_used, swap_total) = (mem.used, mem.total, mem.swap_used, mem.swap_total);
+        let (mem_used, mem_total, swap_used, swap_total) =
+            (mem.used, mem.total, mem.swap_used, mem.swap_total);
         let (load, tasks_running, tasks_total) = read_loadavg();
         let temp_c = read_cpu_temp();
         let freq_mhz = read_cpu_freq();
         let uptime_secs = fs::read_to_string("/proc/uptime")
             .ok()
-            .and_then(|s| s.split_whitespace().next().and_then(|v| v.parse::<f64>().ok()))
+            .and_then(|s| {
+                s.split_whitespace()
+                    .next()
+                    .and_then(|v| v.parse::<f64>().ok())
+            })
             .map(|f| f as u64)
             .unwrap_or(0);
 
@@ -169,9 +178,10 @@ fn read_topology() -> Vec<CoreGroup> {
             let name = entry.file_name();
             let name = name.to_string_lossy();
             if let Some(num) = name.strip_prefix("cpu")
-                && let Ok(i) = num.parse::<usize>() {
-                    cpus.push(i);
-                }
+                && let Ok(i) = num.parse::<usize>()
+            {
+                cpus.push(i);
+            }
         }
     }
     cpus.sort_unstable();
@@ -183,7 +193,11 @@ fn read_topology() -> Vec<CoreGroup> {
     for &cpu in &cpus {
         let base = format!("/sys/devices/system/cpu/cpu{cpu}/topology");
         let read = |f: &str| -> Option<i64> {
-            fs::read_to_string(format!("{base}/{f}")).ok()?.trim().parse().ok()
+            fs::read_to_string(format!("{base}/{f}"))
+                .ok()?
+                .trim()
+                .parse()
+                .ok()
         };
         match (read("physical_package_id"), read("core_id")) {
             (Some(pkg), Some(core)) => {
@@ -221,12 +235,14 @@ fn read_cpu_temp() -> Option<f32> {
             "coretemp" | "k10temp" | "zenpower" | "k8temp" => {
                 // Prefer the package / Tctl-Tdie sensor; fall back to temp1.
                 for i in 1..=8 {
-                    let label = fs::read_to_string(p.join(format!("temp{i}_label"))).unwrap_or_default();
+                    let label =
+                        fs::read_to_string(p.join(format!("temp{i}_label"))).unwrap_or_default();
                     let l = label.trim();
                     if (l.contains("Package") || l == "Tctl" || l == "Tdie")
-                        && let Some(v) = read_milli_c(&p, i) {
-                            return Some(v);
-                        }
+                        && let Some(v) = read_milli_c(&p, i)
+                    {
+                        return Some(v);
+                    }
                 }
                 if let Some(v) = read_milli_c(&p, 1) {
                     return Some(v);
@@ -254,10 +270,11 @@ fn read_cpu_freq() -> Option<f32> {
     for line in info.lines() {
         if line.starts_with("cpu MHz")
             && let Some((_, v)) = line.split_once(':')
-                && let Ok(f) = v.trim().parse::<f32>() {
-                    sum += f;
-                    n += 1;
-                }
+            && let Ok(f) = v.trim().parse::<f32>()
+        {
+            sum += f;
+            n += 1;
+        }
     }
     (n > 0).then(|| sum / n as f32)
 }
@@ -340,6 +357,7 @@ mod tests {
         assert_eq!(t.idle, 85); // idle + iowait
         assert_eq!(t.total, 100); // sum of all
         assert!(CpuTimes::parse("1 2 3").is_none()); // need >= 4 fields
+        assert!(CpuTimes::parse("10 0 x 80 5").is_none()); // bad field shifts positions
     }
 
     #[test]

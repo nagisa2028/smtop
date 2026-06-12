@@ -31,6 +31,7 @@ cargo build --release
   - ソート: `s` 巡回、または `c`(CPU)/`m`(MEM)/`d`(DISK R)/`D`(DISK W)/`g`(GPU%)/`G`(VRAM)/`p`(PID)。`↑↓` でスクロール。アクティブ列は `▾`。
   - GPU per-process: **NVIDIA は NVML 経由で全プロセス**(VRAM + SM%)。**AMD は `/proc/<pid>/fdinfo`**(`drm-total-vram` / `drm-engine-*`、`drm-client-id` で重複排除)で、DISK I/O 同様 **他ユーザは root か `setcap cap_sys_ptrace+ep mon` が必要**。使用率はアクティブ時のみ(アイドルは0)。
   - DISK I/O は `/proc/<pid>/io` 由来。**他ユーザのプロセスは root か `setcap cap_sys_ptrace+ep mon` が必要**(無いと自分のプロセスのみ、他は `n/a`)。
+  - **`setcap` の注意**: file capability は**そのバイナリを実行できる全ユーザー**に有効になる。`CAP_SYS_PTRACE` は他プロセスのメモリ読み出しまで許す強い権限なので、共用ホストでは専用グループに実行を限定すること(例: `chgrp monusers mon && chmod 750 mon` してから `setcap`)。限定できない場合は setcap せず root / sudo 運用が安全。
   - プロセス毎の **Network 帯域は非対応**(procfs にPID毎の帯域が無く、pcap/eBPF + root が必要なため)。
 - NVIDIA対応は `nvidia` feature（デフォルト有効）。`nvml-wrapper` が `libnvidia-ml` を**実行時dlopen**するため、ドライバが無い環境でもビルド・実行でき、その場合 NVIDIA GPU は単に表示されない。
 - NVMLを完全に外したい場合: `cargo build --release --no-default-features`
@@ -44,7 +45,7 @@ cargo build --release
 | NVIDIA GPU | NVML（`nvml-wrapper`） |
 | Network | `/proc/net/dev` |
 | Disk I/O | `/proc/diskstats`（物理デバイスのみ） |
-| Free Space | `/proc/mounts` + `statvfs` |
+| Free Space | `/proc/mounts` + `statvfs`（応答しないネットワークマウントは500msでタイムアウトし、60秒間スキップして再試行） |
 
 各コレクタは専用スレッドで drift-correct ticker により周期収集し、履歴付きスナップショットを `ArcSwap` でロックフリー公開する。UIは独立したFPSで最新値を描画するため、NVMLのストールやCPU高負荷が他指標の更新を妨げない。
 

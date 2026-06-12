@@ -71,10 +71,7 @@ impl Collector for AmdCollector {
                 .unwrap_or(0.0);
             let temp_c = m.and_then(|m| m.temp_c).or(hw_temp);
             let power_w = m.and_then(|m| m.power_w).or(hw_power);
-            let fan = m
-                .and_then(|m| m.fan_rpm)
-                .map(Fan::Rpm)
-                .or(hw_fan);
+            let fan = m.and_then(|m| m.fan_rpm).map(Fan::Rpm).or(hw_fan);
             let sclk_mhz = m
                 .and_then(|m| m.sclk_mhz)
                 .or_else(|| read_current_clock(dev.join("pp_dpm_sclk")));
@@ -209,7 +206,10 @@ pub enum GpuMetricsErr {
     Io,
     TooShort,
     /// A revision we don't decode (e.g. APU v2_x, or newer v1_4/v1_5).
-    Unsupported { format: u8, content: u8 },
+    Unsupported {
+        format: u8,
+        content: u8,
+    },
     /// Table present but all-zero (not yet populated).
     Empty,
 }
@@ -260,8 +260,16 @@ fn parse_gpu_metrics(b: &[u8]) -> Result<GpuMetrics, GpuMetricsErr> {
         return Err(GpuMetricsErr::Empty);
     }
 
-    let temp = if temp_hotspot > 0 { temp_hotspot } else { temp_edge };
-    let sclk = if cur_gfxclk > 0 { cur_gfxclk } else { avg_gfxclk };
+    let temp = if temp_hotspot > 0 {
+        temp_hotspot
+    } else {
+        temp_edge
+    };
+    let sclk = if cur_gfxclk > 0 {
+        cur_gfxclk
+    } else {
+        avg_gfxclk
+    };
 
     Ok(GpuMetrics {
         gfx_activity: gfx as f32,
@@ -299,16 +307,16 @@ mod tests {
         b[2] = 1; // format_revision
         b[3] = 3; // content_revision
         for (off, v) in [
-            (0u16, 120u16),  // structure_size
-            (4, 39),         // temperature_edge
-            (6, 40),         // temperature_hotspot
-            (16, 25),        // average_gfx_activity
-            (22, 12),        // average_socket_power
-            (40, 2000),      // average_gfxclk
-            (54, 2500),      // current_gfxclk
-            (58, 96),        // current_uclk
-            (72, 890),       // current_fan_speed
-            (74, 16),        // pcie_link_width
+            (0u16, 120u16), // structure_size
+            (4, 39),        // temperature_edge
+            (6, 40),        // temperature_hotspot
+            (16, 25),       // average_gfx_activity
+            (22, 12),       // average_socket_power
+            (40, 2000),     // average_gfxclk
+            (54, 2500),     // current_gfxclk
+            (58, 96),       // current_uclk
+            (72, 890),      // current_fan_speed
+            (74, 16),       // pcie_link_width
         ] {
             let o = off as usize;
             b[o..o + 2].copy_from_slice(&v.to_le_bytes());
@@ -344,12 +352,18 @@ mod tests {
         b[3] = 4; // content_revision 4 (v1_4)
         assert_eq!(
             parse_gpu_metrics(&b),
-            Err(GpuMetricsErr::Unsupported { format: 1, content: 4 })
+            Err(GpuMetricsErr::Unsupported {
+                format: 1,
+                content: 4
+            })
         );
 
         let mut apu = metrics_buf();
         apu[2] = 2; // format_revision 2 (APU)
-        assert!(matches!(parse_gpu_metrics(&apu), Err(GpuMetricsErr::Unsupported { .. })));
+        assert!(matches!(
+            parse_gpu_metrics(&apu),
+            Err(GpuMetricsErr::Unsupported { .. })
+        ));
 
         let mut empty = [0u8; 120];
         empty[2] = 1; // valid v1_3 header but all-zero metrics

@@ -20,8 +20,14 @@ use nvml_wrapper::enums::device::UsedGpuMemory;
 pub struct GpuProcCollector {
     #[cfg(feature = "nvidia")]
     nvml: Option<Nvml>,
-    /// pid -> previous summed amdgpu engine ns (for the utilization delta).
-    amd_prev: HashMap<i32, u64>,
+    /// device index -> last seen NVML sample timestamp (µs), so each tick only
+    /// fetches utilization samples newer than the previous one.
+    #[cfg(feature = "nvidia")]
+    nv_last_ts: HashMap<u32, u64>,
+    /// (pid, starttime) -> previous summed amdgpu engine ns (for the
+    /// utilization delta); starttime keeps a recycled PID from inheriting the
+    /// dead process's counter as its baseline.
+    amd_prev: HashMap<(i32, u64), u64>,
     /// drm-pdev (e.g. "0000:05:00.0") -> amd GPU index.
     amd_pdev_idx: HashMap<String, usize>,
     last: Option<Instant>,
@@ -32,6 +38,8 @@ impl GpuProcCollector {
         Self {
             #[cfg(feature = "nvidia")]
             nvml: Nvml::init().ok(),
+            #[cfg(feature = "nvidia")]
+            nv_last_ts: HashMap::new(),
             amd_prev: HashMap::new(),
             amd_pdev_idx: amd_pdev_index(),
             last: None,
@@ -57,13 +65,19 @@ impl Collector for GpuProcCollector {
 
         let mut out: HashMap<i32, GpuProcUse> = HashMap::new();
 
-        let mut amd_cur: HashMap<i32, u64> = HashMap::new();
-        collect_amdgpu(&self.amd_pdev_idx, &self.amd_prev, dt, &mut out, &mut amd_cur);
+        let mut amd_cur: HashMap<(i32, u64), u64> = HashMap::new();
+        collect_amdgpu(
+            &self.amd_pdev_idx,
+            &self.amd_prev,
+            dt,
+            &mut out,
+            &mut amd_cur,
+        );
         self.amd_prev = amd_cur;
 
         #[cfg(feature = "nvidia")]
         if let Some(nvml) = self.nvml.as_ref() {
-            collect_nvidia(nvml, &mut out);
+            collect_nvidia(nvml, &mut self.nv_last_ts, &mut out);
         }
 
         Ok(out)
@@ -158,21 +172,28 @@ fn parse_size(v: &str) -> u64 {
 
 /// Leading integer of e.g. `"649699 ns"`.
 fn parse_leading_u64(v: &str) -> u64 {
-    v.split_whitespace().next().and_then(|x| x.parse().ok()).unwrap_or(0)
+    v.split_whitespace()
+        .next()
+        .and_then(|x| x.parse().ok())
+        .unwrap_or(0)
 }
 
 fn collect_amdgpu(
     pdev_idx: &HashMap<String, usize>,
-    prev: &HashMap<i32, u64>,
+    prev: &HashMap<(i32, u64), u64>,
     dt: Option<f64>,
     out: &mut HashMap<i32, GpuProcUse>,
-    cur: &mut HashMap<i32, u64>,
+    cur: &mut HashMap<(i32, u64), u64>,
 ) {
     let Ok(procs) = fs::read_dir("/proc") else {
         return;
     };
     for entry in procs.flatten() {
-        let Some(pid) = entry.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) else {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<i32>().ok())
+        else {
             continue;
         };
         let Ok(fds) = fs::read_dir(format!("/proc/{pid}/fd")) else {
@@ -202,15 +223,17 @@ fn collect_amdgpu(
             vram += info.vram;
             engine += info.engine_ns;
             if let Some(&idx) = pdev_idx.get(&info.pdev)
-                && !indices.contains(&idx) {
-                    indices.push(idx);
-                }
+                && !indices.contains(&idx)
+            {
+                indices.push(idx);
+            }
         }
         if seen.is_empty() {
             continue;
         }
-        cur.insert(pid, engine);
-        let util = match (prev.get(&pid), dt) {
+        let key = (pid, super::proc::read_starttime(pid));
+        cur.insert(key, engine);
+        let util = match (prev.get(&key), dt) {
             (Some(&pe), Some(dt)) if dt > 0.0 => {
                 (engine.saturating_sub(pe) as f64 / (dt * 1e9) * 100.0) as f32
             }
@@ -239,7 +262,11 @@ fn add_gpu_label(e: &mut GpuProcUse, token: &str) {
 }
 
 #[cfg(feature = "nvidia")]
-fn collect_nvidia(nvml: &Nvml, out: &mut HashMap<i32, GpuProcUse>) {
+fn collect_nvidia(
+    nvml: &Nvml,
+    last_ts: &mut HashMap<u32, u64>,
+    out: &mut HashMap<i32, GpuProcUse>,
+) {
     let count = nvml.device_count().unwrap_or(0);
     for i in 0..count {
         let Ok(dev) = nvml.device_by_index(i) else {
@@ -264,17 +291,29 @@ fn collect_nvidia(nvml: &Nvml, out: &mut HashMap<i32, GpuProcUse>) {
             add_gpu_label(e, &label);
         }
 
-        // Utilization (best-effort: unsupported / no samples -> skipped).
-        if let Ok(samples) = dev.process_utilization_stats(None) {
+        // Utilization (best-effort: unsupported / no new samples -> skipped).
+        // Only fetch samples newer than the previous tick's, instead of the
+        // driver's whole sample buffer every time.
+        if let Ok(samples) = dev.process_utilization_stats(last_ts.get(&i).copied()) {
             let mut latest: HashMap<u32, (u64, u32)> = HashMap::new();
             for s in samples {
-                let newer = latest.get(&s.pid).map(|(t, _)| s.timestamp >= *t).unwrap_or(true);
+                let dev_ts = last_ts.entry(i).or_insert(0);
+                *dev_ts = (*dev_ts).max(s.timestamp);
+                let newer = latest
+                    .get(&s.pid)
+                    .map(|(t, _)| s.timestamp >= *t)
+                    .unwrap_or(true);
                 if newer {
                     latest.insert(s.pid, (s.timestamp, s.sm_util));
                 }
             }
             for (pid, (_, sm)) in latest {
-                out.entry(pid as i32).or_default().util_pct += sm as f32;
+                let e = out.entry(pid as i32).or_default();
+                e.util_pct += sm as f32;
+                // Tag the GPU even when the pid wasn't in the VRAM process
+                // lists, so the GPU column isn't blank for a row that sorts
+                // high on GPU%.
+                add_gpu_label(e, &label);
             }
         }
     }

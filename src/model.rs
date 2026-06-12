@@ -5,8 +5,33 @@
 //! renders whatever is latest at its own frame rate, decoupled from collection.
 
 use std::collections::{HashMap, VecDeque};
+use std::time::Instant;
 
 use arc_swap::ArcSwapOption;
+
+/// A snapshot plus when it was published, so the UI can flag a collector that
+/// stopped updating (stale data) instead of presenting frozen values as live.
+/// `Deref`s to the inner snapshot, so readers use it transparently.
+pub struct Stamped<T> {
+    pub at: Instant,
+    data: T,
+}
+
+impl<T> Stamped<T> {
+    pub fn new(data: T) -> Self {
+        Self {
+            at: Instant::now(),
+            data,
+        }
+    }
+}
+
+impl<T> std::ops::Deref for Stamped<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.data
+    }
+}
 
 /// Number of samples retained per time-series (~120 points is ~1 KB/series).
 pub const HIST_CAP: usize = 120;
@@ -51,7 +76,10 @@ impl History {
     }
 }
 
+// Vendor-neutral data model: without the `nvidia` feature the NVIDIA variants
+// are simply never constructed, which is fine — not dead code to remove.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(feature = "nvidia"), allow(dead_code))]
 pub enum GpuVendor {
     Nvidia,
     Amd,
@@ -59,6 +87,7 @@ pub enum GpuVendor {
 
 /// Fan reading, normalized per vendor (NVIDIA reports %, AMD reports RPM).
 #[derive(Clone, Copy, Debug)]
+#[cfg_attr(not(feature = "nvidia"), allow(dead_code))]
 pub enum Fan {
     Pct(f32),
     Rpm(u32),
@@ -195,16 +224,17 @@ pub struct GpuProcUse {
     pub label: String,
 }
 
-/// Lock-free shared state: one `ArcSwapOption` slot per collector source.
+/// Lock-free shared state: one `ArcSwapOption` slot per collector source,
+/// each timestamped at publish.
 #[derive(Default)]
 pub struct SharedState {
-    pub cpu: ArcSwapOption<CpuSnapshot>,
-    pub amd: ArcSwapOption<Vec<GpuSnapshot>>,
-    pub nvidia: ArcSwapOption<Vec<GpuSnapshot>>,
-    pub net: ArcSwapOption<Vec<NetSnapshot>>,
-    pub disk: ArcSwapOption<Vec<DiskSnapshot>>,
-    pub fs: ArcSwapOption<Vec<FsSnapshot>>,
-    pub procs: ArcSwapOption<Vec<ProcInfo>>,
+    pub cpu: ArcSwapOption<Stamped<CpuSnapshot>>,
+    pub amd: ArcSwapOption<Stamped<Vec<GpuSnapshot>>>,
+    pub nvidia: ArcSwapOption<Stamped<Vec<GpuSnapshot>>>,
+    pub net: ArcSwapOption<Stamped<Vec<NetSnapshot>>>,
+    pub disk: ArcSwapOption<Stamped<Vec<DiskSnapshot>>>,
+    pub fs: ArcSwapOption<Stamped<Vec<FsSnapshot>>>,
+    pub procs: ArcSwapOption<Stamped<Vec<ProcInfo>>>,
     /// pid -> aggregated GPU usage (NVML + amdgpu fdinfo).
-    pub gpu_procs: ArcSwapOption<HashMap<i32, GpuProcUse>>,
+    pub gpu_procs: ArcSwapOption<Stamped<HashMap<i32, GpuProcUse>>>,
 }

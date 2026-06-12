@@ -7,9 +7,12 @@ use std::time::{Duration, Instant};
 use super::Collector;
 use crate::model::ProcInfo;
 
-/// Assumed page size for RSS (statm reports pages). 4 KiB on essentially all
-/// Linux x86_64 systems.
-const PAGE_SIZE: u64 = 4096;
+/// System page size for RSS (statm reports pages). Read from the kernel —
+/// not all systems use 4 KiB (e.g. 16K/64K page ARM64 kernels). rustix caches
+/// the auxv lookup, so calling this per pid is cheap.
+fn page_size() -> u64 {
+    rustix::param::page_size() as u64
+}
 
 /// Per-pid carry-over needed for rate/usage deltas.
 #[derive(Clone, Copy, Default)]
@@ -20,7 +23,9 @@ struct Prev {
 }
 
 pub struct ProcessCollector {
-    prev: HashMap<i32, Prev>,
+    /// Keyed by `(pid, starttime)` so a recycled PID doesn't inherit the dead
+    /// process's counters as its baseline.
+    prev: HashMap<(i32, u64), Prev>,
     /// Previous total CPU jiffies (all cores) for the % denominator.
     prev_total: u64,
     ncpu: f64,
@@ -56,21 +61,28 @@ impl Collector for ProcessCollector {
         let dt = self.last.map(|l| now.duration_since(l).as_secs_f64());
 
         let mut out = Vec::new();
-        let mut cur: HashMap<i32, Prev> = HashMap::new();
+        let mut cur: HashMap<(i32, u64), Prev> = HashMap::new();
 
         for entry in fs::read_dir("/proc")?.flatten() {
             let fname = entry.file_name();
             let Some(pid) = fname.to_str().and_then(|s| s.parse::<i32>().ok()) else {
                 continue;
             };
-            let Some((comm, state, jiffies)) = read_proc_stat(pid) else {
+            let Some((comm, state, jiffies, starttime)) = read_proc_stat(pid) else {
                 continue;
             };
             let io = read_proc_io(pid);
             let io_ok = io.is_some();
             let (read_bytes, write_bytes) = io.unwrap_or((0, 0));
-            let prev = self.prev.get(&pid).copied();
-            cur.insert(pid, Prev { jiffies, read_bytes, write_bytes });
+            let prev = self.prev.get(&(pid, starttime)).copied();
+            cur.insert(
+                (pid, starttime),
+                Prev {
+                    jiffies,
+                    read_bytes,
+                    write_bytes,
+                },
+            );
 
             // CPU% normalized so one fully-busy core reads ~100%.
             let cpu_pct = match prev {
@@ -143,33 +155,50 @@ fn read_total_jiffies() -> u64 {
     stat.lines()
         .next()
         .and_then(|l| l.strip_prefix("cpu "))
-        .map(|rest| rest.split_whitespace().filter_map(|v| v.parse::<u64>().ok()).sum())
+        .map(|rest| {
+            rest.split_whitespace()
+                .filter_map(|v| v.parse::<u64>().ok())
+                .sum()
+        })
         .unwrap_or(0)
 }
 
-/// Returns `(comm, state, utime+stime jiffies)` from `/proc/<pid>/stat`.
-/// The command (field 2) is parenthesized and may contain spaces/parens, so we
-/// split on the last `)` before tokenizing the remaining fields.
-fn read_proc_stat(pid: i32) -> Option<(String, char, u64)> {
+/// Returns `(comm, state, utime+stime jiffies, starttime)` from
+/// `/proc/<pid>/stat`. The command (field 2) is parenthesized and may contain
+/// spaces/parens, so we split on the last `)` before tokenizing the remaining
+/// fields. `starttime` (boot-relative ticks) identifies this incarnation of
+/// the PID.
+fn read_proc_stat(pid: i32) -> Option<(String, char, u64, u64)> {
     let s = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let open = s.find('(')?;
     let close = s.rfind(')')?;
     let comm = s.get(open + 1..close)?.to_string();
     let rest = s.get(close + 1..)?;
     let f: Vec<&str> = rest.split_whitespace().collect();
-    // After ')': index 0 = state (field 3) … index 11 = utime (14), 12 = stime (15).
+    // After ')': index 0 = state (field 3) … 11 = utime (14), 12 = stime (15),
+    // 19 = starttime (22).
     let state = f.first().and_then(|s| s.chars().next()).unwrap_or('?');
     let utime: u64 = f.get(11).and_then(|v| v.parse().ok()).unwrap_or(0);
     let stime: u64 = f.get(12).and_then(|v| v.parse().ok()).unwrap_or(0);
-    Some((comm, state, utime + stime))
+    let starttime: u64 = f.get(19).and_then(|v| v.parse().ok()).unwrap_or(0);
+    Some((comm, state, utime + stime, starttime))
+}
+
+/// `starttime` alone, for callers that track per-pid deltas without the rest.
+pub(super) fn read_starttime(pid: i32) -> u64 {
+    read_proc_stat(pid).map(|(_, _, _, st)| st).unwrap_or(0)
 }
 
 /// Resident set size in bytes from `/proc/<pid>/statm` (field 2 = pages).
 fn read_rss(pid: i32) -> u64 {
     fs::read_to_string(format!("/proc/{pid}/statm"))
         .ok()
-        .and_then(|s| s.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok()))
-        .map(|pages| pages * PAGE_SIZE)
+        .and_then(|s| {
+            s.split_whitespace()
+                .nth(1)
+                .and_then(|v| v.parse::<u64>().ok())
+        })
+        .map(|pages| pages * page_size())
         .unwrap_or(0)
 }
 

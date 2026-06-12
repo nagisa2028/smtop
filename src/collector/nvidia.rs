@@ -65,7 +65,10 @@ impl Collector for NvidiaCollector {
                 .memory_info()
                 .map(|m| (m.used, m.total))
                 .unwrap_or((0, 0));
-            let temp_c = dev.temperature(TemperatureSensor::Gpu).ok().map(|t| t as f32);
+            let temp_c = dev
+                .temperature(TemperatureSensor::Gpu)
+                .ok()
+                .map(|t| t as f32);
             let power_w = dev.power_usage().ok().map(|mw| mw as f32 / 1000.0);
             let sclk_mhz = dev.clock_info(Clock::Graphics).ok();
             let mclk_mhz = dev.clock_info(Clock::Memory).ok();
