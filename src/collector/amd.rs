@@ -170,7 +170,8 @@ fn read_name(dev: &Path) -> String {
         .find_map(|l| l.strip_prefix("PCI_ID="))
         .unwrap_or("?");
     // PCI_ID is "VVVV:DDDD" (hex). Resolve the device id to a marketing name via
-    // the system pci.ids database; fall back to the raw id when it's unavailable.
+    // the pci.ids database (bundled AMD subset + system copy); fall back to the
+    // raw id only when even that misses.
     if let Some((_vendor, dev_id)) = pci_id.split_once(':')
         && let Ok(id) = u16::from_str_radix(dev_id.trim(), 16)
         && let Some(name) = amd_pci_names().get(&id)
@@ -187,18 +188,27 @@ const PCI_IDS_PATHS: &[&str] = &[
     "/var/lib/pciutils/pci.ids",
 ];
 
-/// AMD (vendor `0x1002`) device-id → marketing name, parsed once from the
-/// system `pci.ids`. Empty if the database isn't installed — callers then fall
-/// back to the raw PCI id. amdgpu's vendor is always 0x1002, so we only scan
-/// that one block rather than building the whole ~40k-line table.
+/// AMD (vendor `0x1002`) device-id → marketing name. amdgpu's vendor is always
+/// 0x1002, so we only scan that one block rather than the whole ~40k-line table.
+///
+/// Built once from a bundled AMD-only snapshot of pci.ids, then overlaid with
+/// the host's system `pci.ids` (system wins where it has an id, snapshot fills
+/// the rest). The bundle guarantees names for recent APU iGPUs (Barcelo,
+/// Phoenix, Raphael, Rembrandt, …) even on hosts whose system pci.ids predates
+/// that hardware — without it those cards fall back to the raw PCI id.
 fn amd_pci_names() -> &'static HashMap<u16, String> {
+    /// AMD subset of pci.ids compiled into the binary; see the file header.
+    const BUNDLED_AMD_PCI_IDS: &str = include_str!("pci_ids_amd.txt");
     static NAMES: OnceLock<HashMap<u16, String>> = OnceLock::new();
     NAMES.get_or_init(|| {
-        PCI_IDS_PATHS
+        let mut map = parse_pci_ids_vendor(BUNDLED_AMD_PCI_IDS, 0x1002);
+        if let Some(system) = PCI_IDS_PATHS
             .iter()
             .find_map(|p| fs::read_to_string(p).ok())
-            .map(|c| parse_pci_ids_vendor(&c, 0x1002))
-            .unwrap_or_default()
+        {
+            map.extend(parse_pci_ids_vendor(&system, 0x1002));
+        }
+        map
     })
 }
 
@@ -487,6 +497,21 @@ mod tests {
         assert!(!amd.contains_key(&0x2504));
         assert!(!amd.contains_key(&0x8950));
         assert_eq!(amd.len(), 2);
+    }
+
+    #[test]
+    fn bundled_pci_ids_resolves_apu_igpus() {
+        // The compiled-in AMD subset must name recent APU iGPUs on its own, so
+        // hosts with a stale/absent system pci.ids don't fall back to raw hex.
+        let amd = parse_pci_ids_vendor(include_str!("pci_ids_amd.txt"), 0x1002);
+        assert_eq!(amd.get(&0x15e7).map(String::as_str), Some("Barcelo")); // 5825U
+        assert_eq!(amd.get(&0x1681).map(String::as_str), Some("Radeon 680M")); // Rembrandt
+        assert_eq!(amd.get(&0x164e).map(String::as_str), Some("Raphael"));
+        assert!(
+            amd.len() > 100,
+            "expected the full AMD block, got {}",
+            amd.len()
+        );
     }
 
     #[test]
