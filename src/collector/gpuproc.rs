@@ -2,8 +2,8 @@
 //!
 //! NVIDIA via NVML (sees all processes, no root needed). AMD via amdgpu
 //! `/proc/<pid>/fdinfo` (own processes only unless root/CAP_SYS_PTRACE),
-//! de-duplicated by `drm-client-id`, with utilization from `drm-engine-*` ns
-//! deltas.
+//! de-duplicated by `drm-pdev` + `drm-client-id`, with utilization from
+//! `drm-engine-*` ns deltas.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -63,6 +63,11 @@ impl Collector for GpuProcCollector {
         let dt = self.last.map(|l| now.duration_since(l).as_secs_f64());
         self.last = Some(now);
 
+        // Public map is keyed by PID only. If a PID is recycled between this
+        // tick and the UI's join, the new process can briefly show the prior
+        // process's GPU/VRAM until the next tick overwrites it — an accepted
+        // ~1-sample window (delta tracking below keys on (pid, starttime), so
+        // only the display join is affected).
         let mut out: HashMap<i32, GpuProcUse> = HashMap::new();
 
         let mut amd_cur: HashMap<(i32, u64), u64> = HashMap::new();
@@ -131,7 +136,12 @@ fn parse_fdinfo(content: &str) -> Option<FdInfo> {
     let mut client_id = None;
     let mut pdev = String::new();
     let mut vram = 0;
-    let mut engine_ns = 0;
+    // Per drm-usage-stats: any `drm-engine-<name>` reports busy ns for that
+    // engine, and an optional `drm-engine-capacity-<name>` gives how many
+    // parallel units it has (default 1). Utilization normalizes each engine's
+    // busy time by its capacity, so collect both and combine after the loop.
+    let mut engines: HashMap<String, u64> = HashMap::new();
+    let mut capacities: HashMap<String, u64> = HashMap::new();
     for line in content.lines() {
         let Some((k, v)) = line.split_once(':') else {
             continue;
@@ -142,13 +152,28 @@ fn parse_fdinfo(content: &str) -> Option<FdInfo> {
             "drm-client-id" => client_id = v.parse().ok(),
             "drm-pdev" => pdev = v.to_string(),
             "drm-total-vram" => vram = parse_size(v),
-            "drm-engine-gfx" | "drm-engine-compute" => engine_ns += parse_leading_u64(v),
-            _ => {}
+            // Check the capacity prefix first: `drm-engine-capacity-<name>`
+            // also matches the `drm-engine-` prefix.
+            k => {
+                if let Some(name) = k.strip_prefix("drm-engine-capacity-") {
+                    capacities.insert(name.to_string(), parse_leading_u64(v).max(1));
+                } else if let Some(name) = k.strip_prefix("drm-engine-") {
+                    engines.insert(name.to_string(), parse_leading_u64(v));
+                }
+            }
         }
     }
     if driver != "amdgpu" {
         return None;
     }
+    // Sum capacity-normalized busy ns across every engine (gfx/compute/dec/enc/
+    // sdma/…). Capacity is constant over time, so a single summed value keeps
+    // the downstream ns-delta math unchanged. Integer division drops
+    // ≤(capacity−1) ns per sample, negligible against `dt * 1e9`.
+    let engine_ns = engines
+        .iter()
+        .map(|(name, &ns)| ns / capacities.get(name).copied().unwrap_or(1).max(1))
+        .sum();
     Some(FdInfo {
         client_id: client_id?,
         pdev,
@@ -199,7 +224,7 @@ fn collect_amdgpu(
         let Ok(fds) = fs::read_dir(format!("/proc/{pid}/fd")) else {
             continue;
         };
-        let mut seen: HashSet<u64> = HashSet::new();
+        let mut seen: HashSet<(String, u64)> = HashSet::new();
         let mut vram = 0u64;
         let mut engine = 0u64;
         let mut indices: Vec<usize> = Vec::new();
@@ -217,7 +242,7 @@ fn collect_amdgpu(
             let Some(info) = parse_fdinfo(&content) else {
                 continue;
             };
-            if !seen.insert(info.client_id) {
+            if !seen.insert(fdinfo_client_key(&info)) {
                 continue; // same GPU client via another fd
             }
             vram += info.vram;
@@ -261,6 +286,10 @@ fn add_gpu_label(e: &mut GpuProcUse, token: &str) {
     e.label.push_str(token);
 }
 
+fn fdinfo_client_key(info: &FdInfo) -> (String, u64) {
+    (info.pdev.clone(), info.client_id)
+}
+
 #[cfg(feature = "nvidia")]
 fn collect_nvidia(
     nvml: &Nvml,
@@ -281,12 +310,16 @@ fn collect_nvidia(
         if let Ok(p) = dev.running_graphics_processes() {
             procs.extend(p);
         }
+        let mut mem_by_pid: HashMap<u32, u64> = HashMap::new();
         for p in procs {
             let mem = match p.used_gpu_memory {
                 UsedGpuMemory::Used(b) => b,
                 UsedGpuMemory::Unavailable => 0,
             };
-            let e = out.entry(p.pid as i32).or_default();
+            remember_pid_vram(&mut mem_by_pid, p.pid, mem);
+        }
+        for (pid, mem) in mem_by_pid {
+            let e = out.entry(pid as i32).or_default();
             e.vram += mem;
             add_gpu_label(e, &label);
         }
@@ -316,5 +349,67 @@ fn collect_nvidia(
                 add_gpu_label(e, &label);
             }
         }
+    }
+}
+
+#[cfg(feature = "nvidia")]
+fn remember_pid_vram(mem_by_pid: &mut HashMap<u32, u64>, pid: u32, mem: u64) {
+    mem_by_pid
+        .entry(pid)
+        .and_modify(|m| *m = (*m).max(mem))
+        .or_insert(mem);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn amd_fdinfo_dedup_key_includes_pci_device() {
+        let a = FdInfo {
+            client_id: 7,
+            pdev: "0000:05:00.0".into(),
+            vram: 0,
+            engine_ns: 0,
+        };
+        let b = FdInfo {
+            client_id: 7,
+            pdev: "0000:06:00.0".into(),
+            vram: 0,
+            engine_ns: 0,
+        };
+
+        assert_ne!(fdinfo_client_key(&a), fdinfo_client_key(&b));
+    }
+
+    #[test]
+    fn amd_fdinfo_sums_all_engines_normalized_by_capacity() {
+        let content = "\
+drm-driver:\tamdgpu
+drm-client-id:\t42
+drm-pdev:\t0000:05:00.0
+drm-total-vram:\t10240 KiB
+drm-engine-gfx:\t1000 ns
+drm-engine-compute:\t2000 ns
+drm-engine-dec:\t800 ns
+drm-engine-capacity-dec:\t2
+";
+        let info = parse_fdinfo(content).expect("amdgpu fdinfo");
+        // gfx(1000) + compute(2000) + dec(800/2=400) = 3400
+        assert_eq!(info.engine_ns, 3400);
+        assert_eq!(info.client_id, 42);
+        assert_eq!(info.vram, 10240 * 1024);
+    }
+
+    #[cfg(feature = "nvidia")]
+    #[test]
+    fn nvidia_proc_vram_keeps_largest_duplicate_sample() {
+        let mut by_pid = HashMap::new();
+        remember_pid_vram(&mut by_pid, 42, 1024);
+        remember_pid_vram(&mut by_pid, 42, 512);
+        remember_pid_vram(&mut by_pid, 42, 2048);
+
+        assert_eq!(by_pid.get(&42), Some(&2048));
+        assert_eq!(by_pid.len(), 1);
     }
 }

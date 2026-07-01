@@ -21,7 +21,8 @@ use crate::model::{
     CoreGroup, CpuSnapshot, DiskSnapshot, Fan, FsSnapshot, GpuProcUse, GpuSnapshot, GpuVendor,
     NetSnapshot, ProcInfo, SharedState,
 };
-use widgets::{fmt_bytes, fmt_link, fmt_rate, fmt_uptime, hbar, usage_color};
+pub use widgets::fmt_bytes;
+use widgets::{fmt_link, fmt_rate, fmt_uptime, hbar, usage_color};
 
 const FRAME_MS: u64 = 250;
 
@@ -142,10 +143,18 @@ fn set_sort(view: &mut View, s: ProcSort) {
 
 pub fn run(state: Arc<SharedState>, shutdown: Arc<AtomicBool>) -> io::Result<()> {
     let mut terminal = ratatui::init();
+    let _restore = RestoreTerminal;
     let res = run_loop(&mut terminal, &state);
-    ratatui::restore();
     shutdown.store(true, Ordering::Relaxed);
     res
+}
+
+struct RestoreTerminal;
+
+impl Drop for RestoreTerminal {
+    fn drop(&mut self) {
+        ratatui::restore();
+    }
 }
 
 fn run_loop(terminal: &mut DefaultTerminal, state: &SharedState) -> io::Result<()> {
@@ -395,10 +404,11 @@ fn render_gpu_band(
         Style::new().fg(color).add_modifier(Modifier::DIM)
     };
     let cursor = if selected { "▸ " } else { "  " };
+    let gpu_name = clean_text(&g.name);
     let block = Block::bordered().border_style(border_style).title(
         format!(
             "{cursor}GPU{} {} {}  {:.0}%",
-            g.index, sym, g.name, g.busy_pct
+            g.index, sym, gpu_name, g.busy_pct
         )
         .bold(),
     );
@@ -448,7 +458,7 @@ fn render_gpu_band(
 fn gpu_telemetry_line(g: &GpuSnapshot) -> Line<'static> {
     if let Some(note) = &g.note {
         return Line::from(Span::styled(
-            format!("⚠ {note}"),
+            format!("⚠ {}", clean_text(note)),
             Style::new().fg(Color::Yellow),
         ));
     }
@@ -528,7 +538,7 @@ fn render_gpu_procs(
             pid,
             util,
             fmt_bytes(*vram),
-            truncate(name, cmd_w)
+            clean_truncate(name, cmd_w)
         )));
     }
     frame.render_widget(Paragraph::new(lines), area);
@@ -640,9 +650,19 @@ fn hostname() -> &'static str {
     static HOST: OnceLock<String> = OnceLock::new();
     HOST.get_or_init(|| {
         std::fs::read_to_string("/proc/sys/kernel/hostname")
-            .map(|s| s.trim().to_string())
+            .map(|s| clean_text(s.trim()))
             .unwrap_or_else(|_| "?".into())
     })
+}
+
+/// Strip terminal control characters from externally sourced labels before
+/// rendering them in raw TUI mode.
+fn clean_text(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).collect()
+}
+
+fn clean_truncate(s: &str, max: usize) -> String {
+    truncate(&clean_text(s), max)
 }
 
 /// Top header: identity, clock, tab bar, per-collector liveness, key hints.
@@ -700,7 +720,9 @@ fn render_header(frame: &mut Frame, area: Rect, state: &SharedState, view: &View
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
     let hints = match view.tab {
-        Tab::Processes => "Tab/1-3:tabs  c/m/d/D/g/G/p:sort  r:reverse  ↑↓:scroll  Esc/q:quit",
+        Tab::Processes => {
+            "Tab/1-3:tabs  c/m/d/D/g/G/p:sort  r:reverse  ↑↓:scroll  Esc:Overview  q:quit"
+        }
         Tab::Gpu => "Tab/1-3:tabs  ↑↓:select GPU  Esc:Overview  q:quit",
         Tab::Overview => "Tab/1-3:tabs  space:pause  q:quit",
     };
@@ -832,7 +854,7 @@ fn render_processes(frame: &mut Frame, area: Rect, state: &SharedState, view: &V
     };
     let mut lines = vec![header];
     for p in list.iter().skip(scroll).take(visible) {
-        let name: String = p.name.chars().take(cmd_w).collect();
+        let name: String = clean_text(&p.name).chars().take(cmd_w).collect();
         // GPU cell: "<label> <util>%" (e.g. "N0 45%"); blank if not using a GPU.
         let g = gpu_of(p.pid);
         let gpu_text = match g {
@@ -868,7 +890,7 @@ fn render_processes(frame: &mut Frame, area: Rect, state: &SharedState, view: &V
 fn render_cpu(frame: &mut Frame, area: Rect, cpu: &CpuSnapshot) {
     let title = format!(
         " CPU  {}   load {:.2} {:.2} {:.2}   up {}   tasks {}/{} ",
-        cpu.model,
+        clean_text(&cpu.model),
         cpu.load[0],
         cpu.load[1],
         cpu.load[2],
@@ -1059,7 +1081,7 @@ fn render_gpu_card(frame: &mut Frame, area: Rect, g: &GpuSnapshot) {
     };
     let block = Block::bordered()
         .border_style(Style::new().fg(color))
-        .title(format!(" GPU{} {} {} ", g.index, sym, g.name).bold());
+        .title(format!(" GPU{} {} {} ", g.index, sym, clean_text(&g.name)).bold());
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.height < 3 {
@@ -1099,7 +1121,7 @@ fn render_gpu_card(frame: &mut Frame, area: Rect, g: &GpuSnapshot) {
     let mut stats: Vec<Span> = if let Some(note) = &g.note {
         // Telemetry is missing for an explained reason — show it instead of 0%.
         vec![Span::styled(
-            format!("⚠ {note}"),
+            format!("⚠ {}", clean_text(note)),
             Style::new().fg(Color::Yellow),
         )]
     } else if g.suspended {
@@ -1206,7 +1228,7 @@ fn render_net(frame: &mut Frame, area: Rect, net: &[NetSnapshot]) {
                 (false, _) => Span::styled(" down", Style::new().fg(Color::Red)),
             };
             Line::from(vec![
-                Span::raw(format!("{:<8}", truncate(&n.iface, 8))),
+                Span::raw(format!("{:<8}", clean_truncate(&n.iface, 8))),
                 Span::styled(
                     format!("▼{:>8}", fmt_rate(n.rx_bps)),
                     Style::new().fg(Color::Green),
@@ -1262,7 +1284,7 @@ fn render_disk(frame: &mut Frame, area: Rect, disk: &[DiskSnapshot]) {
         .take(list_n)
         .map(|d| {
             Line::from(vec![
-                Span::raw(format!("{:<7}", truncate(&d.dev, 7))),
+                Span::raw(format!("{:<7}", clean_truncate(&d.dev, 7))),
                 Span::styled(
                     format!("{:>3.0}%", d.util_pct),
                     Style::new().fg(usage_color(d.util_pct)),
@@ -1293,7 +1315,12 @@ fn render_disk(frame: &mut Frame, area: Rect, disk: &[DiskSnapshot]) {
         let w = top.w_hist.points();
         let ymax = top.r_hist.max().max(top.w_hist.max());
         let iops_title = Line::from(Span::styled(
-            format!(" {} {:.0}/{:.0} iops ", top.dev, top.r_iops, top.w_iops),
+            format!(
+                " {} {:.0}/{:.0} iops ",
+                clean_text(&top.dev),
+                top.r_iops,
+                top.w_iops
+            ),
             Style::new().add_modifier(Modifier::DIM),
         ));
         frame.render_widget(
@@ -1322,7 +1349,7 @@ fn render_free(frame: &mut Frame, area: Rect, fs: &[FsSnapshot]) {
     let mw = fs
         .iter()
         .take(n)
-        .map(|f| f.mount.chars().count().min(16))
+        .map(|f| clean_text(&f.mount).chars().count().min(16))
         .max()
         .unwrap_or(4);
     let text_w = (mw as u16 + 16).min(inner.width.saturating_sub(3));
@@ -1351,7 +1378,7 @@ fn render_free(frame: &mut Frame, area: Rect, fs: &[FsSnapshot]) {
         frame.render_widget(
             Paragraph::new(format!(
                 "{:>mw$} {:>10} {:>4}",
-                truncate(&f.mount, mw),
+                clean_truncate(&f.mount, mw),
                 format!("{}/{}", fmt_bytes(f.used), fmt_bytes(f.total)),
                 format!("{:.0}%", p),
             ))
@@ -1421,6 +1448,12 @@ mod tests {
         assert_eq!(Tab::Gpu.next(), Tab::Overview);
         assert_eq!(Tab::Overview.prev(), Tab::Gpu);
         assert_eq!(Tab::Processes.prev(), Tab::Overview);
+    }
+
+    #[test]
+    fn clean_text_strips_terminal_controls() {
+        assert_eq!(clean_text("ok\u{1b}]0;bad\u{7}\nname\0"), "ok]0;badname");
+        assert_eq!(clean_truncate("abcdef", 4), "…def");
     }
 
     #[test]
@@ -1695,14 +1728,20 @@ mod tests {
     #[test]
     fn gpu_tab_renders_both_vendors() {
         let state = SharedState::default();
-        state.nvidia.store(Some(std::sync::Arc::new(Stamped::new(vec![
-            gpu_snap(GpuVendor::Nvidia, 0, "RTX_TEST"),
-        ]))));
-        state.amd.store(Some(std::sync::Arc::new(Stamped::new(vec![gpu_snap(
-            GpuVendor::Amd,
-            0,
-            "RADEON_TEST",
-        )]))));
+        state
+            .nvidia
+            .store(Some(std::sync::Arc::new(Stamped::new(vec![gpu_snap(
+                GpuVendor::Nvidia,
+                0,
+                "RTX_TEST",
+            )]))));
+        state
+            .amd
+            .store(Some(std::sync::Arc::new(Stamped::new(vec![gpu_snap(
+                GpuVendor::Amd,
+                0,
+                "RADEON_TEST",
+            )]))));
         let view = View {
             tab: Tab::Gpu,
             ..View::default()

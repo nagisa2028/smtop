@@ -7,6 +7,7 @@ use std::sync::atomic::AtomicBool;
 
 use collector::spawn;
 use model::{SharedState, Stamped};
+use ui::fmt_bytes;
 
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -144,7 +145,7 @@ fn print_probe(state: &SharedState) {
                     g.index,
                     clean(&g.name),
                     match (&g.note, g.suspended) {
-                        (Some(n), _) => format!(" [{n}]"),
+                        (Some(n), _) => format!(" [{}]", clean(n)),
                         (None, true) => " [suspended]".into(),
                         (None, false) => String::new(),
                     },
@@ -188,17 +189,22 @@ fn print_probe(state: &SharedState) {
         for d in disk.iter() {
             println!(
                 "DISK {}  r={:.0} w={:.0} B/s  util={:.0}%  iops r{:.0}/w{:.0}",
-                d.dev, d.r_bps, d.w_bps, d.util_pct, d.r_iops, d.w_iops
+                clean(&d.dev),
+                d.r_bps,
+                d.w_bps,
+                d.util_pct,
+                d.r_iops,
+                d.w_iops
             );
         }
     }
     if let Some(fs) = state.fs.load_full() {
         for f in fs.iter().take(6) {
             println!(
-                "FS   {}  {}/{} GB",
+                "FS   {}  {}/{}",
                 clean(&f.mount),
-                f.used / 1073741824,
-                f.total / 1073741824
+                fmt_bytes(f.used),
+                fmt_bytes(f.total)
             );
         }
     }
@@ -210,7 +216,7 @@ fn print_probe(state: &SharedState) {
             println!(
                 "  {:>7} [{}] {:.0}% util  {} MB VRAM",
                 pid,
-                g.label,
+                clean(&g.label),
                 g.util_pct,
                 g.vram / 1048576
             );
