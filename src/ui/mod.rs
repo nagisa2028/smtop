@@ -669,7 +669,7 @@ fn clean_truncate(s: &str, max: usize) -> String {
 fn render_header(frame: &mut Frame, area: Rect, state: &SharedState, view: &View) {
     let now = chrono::Local::now().format("%H:%M:%S");
     let mut spans = vec![
-        Span::styled("mon", Style::new().fg(Color::Cyan).bold()),
+        Span::styled("smtop", Style::new().fg(Color::Cyan).bold()),
         Span::raw(" "),
         Span::styled(hostname(), Style::new().fg(Color::White)),
         Span::styled(

@@ -1,7 +1,11 @@
 [package]
-name = "mon"
+name = "smtop"
 version = "0.1.0"
 edition = "2024"
+description = "Single-screen terminal node monitor: CPU, RAM, mixed NVIDIA+AMD GPUs (no ROCm needed), network and disk at a glance"
+repository = "https://github.com/nagisa2028/smtop"
+license = "Apache-2.0"
+readme = "README.md"
 
 [dependencies]
 anyhow = "1.0.103"

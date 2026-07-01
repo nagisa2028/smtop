@@ -16,17 +16,17 @@ fn main() -> std::io::Result<()> {
         match args.get(i + 1).filter(|p| !p.starts_with("--")) {
             Some(path) => {
                 if let Err(e) = collector::init_logger(path) {
-                    eprintln!("mon: cannot open log {path}: {e}");
+                    eprintln!("smtop: cannot open log {path}: {e}");
                 }
             }
-            None => eprintln!("mon: --log expects a file path"),
+            None => eprintln!("smtop: --log expects a file path"),
         }
     }
     // `--interval <ms>`: base sampling interval (default 1000).
     if let Some(i) = args.iter().position(|a| a == "--interval") {
         match args.get(i + 1).and_then(|v| v.parse::<u64>().ok()) {
             Some(ms) => collector::set_interval_ms(ms),
-            None => eprintln!("mon: --interval expects milliseconds"),
+            None => eprintln!("smtop: --interval expects milliseconds"),
         }
     }
 

@@ -27,7 +27,7 @@ static LOGGER: OnceLock<Mutex<File>> = OnceLock::new();
 pub fn init_logger(path: &str) -> std::io::Result<()> {
     let file = File::options().create(true).append(true).open(path)?;
     let _ = LOGGER.set(Mutex::new(file));
-    log_line("--- mon log opened ---");
+    log_line("--- smtop log opened ---");
     Ok(())
 }
 

@@ -1,67 +1,119 @@
-# mon
+# smtop
 
-混在GPU環境（NVIDIA RTX + AMD Radeon）向けのノード統合監視TUI。
-CPU / RAM / GPU群 / Network / Disk I/O / Free Space を1画面・時系列で表示する。
+A single-screen terminal (TUI) node monitor for **mixed-GPU machines**
+(NVIDIA RTX + AMD Radeon). It shows CPU / RAM / all GPUs / Network / Disk I/O /
+Free Space together, with time-series history, on one screen.
 
-既存ツールの穴を埋める:
-- **btop** は AMD を ROCm SMI 経由で読むため、ROCm非対応のコンシューマRadeon/APUを列挙できない。
-- **mon** は AMD を **amdgpu sysfs 直読み**（ROCm不要）、NVIDIA を **NVML** で取得するので、両ベンダーを同一画面に同時表示できる。
+## Why another monitor?
 
-## レイアウト（3段）
+- **btop** reads AMD GPUs through **ROCm SMI**, so it can't enumerate consumer
+  Radeon cards / APUs that ROCm doesn't support.
+- **nvtop** unifies multiple GPU vendors, but it is **GPU-only** — no CPU,
+  network, or disk.
+- The common workaround is to run btop and a GPU tool side by side in tmux.
 
-1. **CPU / RAM** — コア毎使用率バー + 使用率/メモリ% 時系列 + loadavg + uptime + タスク数(running/total) + CPU温度/クロック + RAM/Swap ゲージ + メモリ内訳(available/cache)
-2. **GPU** — GPU毎カード横並び（使用率/VRAM時系列、温度・電力・クロック・ファン・PCIe、APUはGTTも）
-3. **Network | Disk I/O | Free Space** — 横3カラム（rate系は時系列グラフ、容量系はゲージ）。Networkはリンク速度/状態、DiskはI/O %util と IOPS も表示。幅が狭いと縦スタックにリフロー。
+**smtop** reads AMD via the **amdgpu sysfs interface directly (no ROCm)** and
+NVIDIA via **NVML**, so both vendors — plus the rest of the node — appear on the
+same screen at a glance.
 
-> 既知の未対応（今後）: NVMe等のドライブ温度・マザボ系の全センサ列挙。
+## Layout (3 rows)
 
-## ビルド / 実行
+1. **CPU / RAM** — per-core usage bars + usage/memory% history + loadavg +
+   uptime + task counts (running/total) + CPU temperature/clock + RAM/Swap
+   gauges + memory breakdown (available/cache).
+2. **GPU** — one card panel per GPU, side by side (util/VRAM history,
+   temperature, power, clock, fan, PCIe; APUs also show GTT).
+3. **Network | Disk I/O | Free Space** — three columns (rates as time-series
+   graphs, capacities as gauges). Network shows link speed/state; Disk shows I/O
+   %util and IOPS. Reflows to a vertical stack when the terminal is narrow.
+
+> Not implemented yet (future): NVMe/drive temperatures and full
+> motherboard-sensor enumeration.
+
+## Build / Run
 
 ```sh
 cargo build --release
-./target/release/mon                  # q / Ctrl-C で終了、Esc で一段戻る(Overviewでは終了)、space で一時停止
-./target/release/mon --interval 500   # サンプリング間隔(ms, 既定1000)
-./target/release/mon --log mon.log    # コレクタのエラーをファイルに記録(新ハード診断用)
-./target/release/mon --probe          # TTYなしで1回ダンプ(SSH確認用)
+./target/release/smtop                  # q / Ctrl-C to quit, Esc backs out one level (quits on Overview), space to pause
+./target/release/smtop --interval 500   # sampling interval (ms, default 1000)
+./target/release/smtop --log smtop.log  # record collector errors to a file (for diagnosing new hardware)
+./target/release/smtop --probe          # one-shot dump without a TTY (handy over SSH)
 ```
 
-- ヘッダにホスト名・時刻・タブ・各コレクタの稼働状況(緑=稼働/赤=未publish)を表示。
-- タブ: `Tab`/`1`/`2`/`3` で **Overview**(ダッシュボード)/ **Processes**(PID一覧)/ **GPU**(GPU毎のnvtop風詳細)を切替。`Esc` は一段戻る(Overviewでは終了)。
-  - Processes 列: PID / CPU% / MEM / DISK R / DISK W / **GPU**(どのGPU+使用率, 例 `N0 45%`)/ **VRAM** / STATE / COMMAND。
-  - ソート: `s` 巡回、または `c`(CPU)/`m`(MEM)/`d`(DISK R)/`D`(DISK W)/`g`(GPU%)/`G`(VRAM)/`p`(PID)。`↑↓` でスクロール。アクティブ列は `▾`。
-  - GPU per-process: **NVIDIA は NVML 経由で全プロセス**(VRAM + SM%)。**AMD は `/proc/<pid>/fdinfo`**(`drm-total-vram` / `drm-engine-*`、`drm-pdev` + `drm-client-id` で重複排除)で、DISK I/O 同様 **他ユーザは root か `setcap cap_sys_ptrace+ep mon` が必要**。使用率はアクティブ時のみ(アイドルは0)。
-  - DISK I/O は `/proc/<pid>/io` 由来。**他ユーザのプロセスは root か `setcap cap_sys_ptrace+ep mon` が必要**(無いと自分のプロセスのみ、他は `n/a`)。
-  - **`setcap` の注意**: file capability は**そのバイナリを実行できる全ユーザー**に有効になる。`CAP_SYS_PTRACE` は他プロセスのメモリ読み出しまで許す強い権限なので、共用ホストでは専用グループに実行を限定すること(例: `chgrp monusers mon && chmod 750 mon` してから `setcap`)。限定できない場合は setcap せず root / sudo 運用が安全。
-  - プロセス毎の **Network 帯域は非対応**(procfs にPID毎の帯域が無く、pcap/eBPF + root が必要なため)。
-- NVIDIA対応は `nvidia` feature（デフォルト有効）。`nvml-wrapper` が `libnvidia-ml` を**実行時dlopen**するため、ドライバが無い環境でもビルド・実行でき、その場合 NVIDIA GPU は単に表示されない。
-- NVMLを完全に外したい場合: `cargo build --release --no-default-features`
+- The header shows hostname, time, tabs, and per-collector liveness
+  (green = live / red = not yet published).
+- Tabs: `Tab`/`1`/`2`/`3` switch **Overview** (dashboard) / **Processes** (PID
+  list) / **GPU** (per-GPU nvtop-style detail). `Esc` backs out one level (quits
+  on Overview).
+  - Processes columns: PID / CPU% / MEM / DISK R / DISK W / **GPU** (which GPU +
+    util, e.g. `N0 45%`) / **VRAM** / STATE / COMMAND.
+  - Sorting: cycle with `s`, or pick `c` (CPU) / `m` (MEM) / `d` (DISK R) /
+    `D` (DISK W) / `g` (GPU%) / `G` (VRAM) / `p` (PID). `↑↓` scrolls. The active
+    column is marked `▾`.
+  - Per-process GPU: **NVIDIA via NVML for all processes** (VRAM + SM%).
+    **AMD via `/proc/<pid>/fdinfo`** (`drm-total-vram` / `drm-engine-*`,
+    de-duplicated by `drm-pdev` + `drm-client-id`). Like DISK I/O, seeing other
+    users' processes needs **root or `setcap cap_sys_ptrace+ep smtop`**.
+    Utilization is reported only while active (idle = 0).
+  - DISK I/O comes from `/proc/<pid>/io`. Other users' processes need **root or
+    `setcap cap_sys_ptrace+ep smtop`** (otherwise only your own processes are
+    shown; the rest are `n/a`).
+  - **`setcap` caveat**: a file capability applies to **every user who can
+    execute the binary**. `CAP_SYS_PTRACE` is powerful (it permits reading other
+    processes' memory), so on shared hosts restrict execution to a dedicated
+    group (e.g. `chgrp smtopusers smtop && chmod 750 smtop`, then `setcap`). If
+    you can't restrict it, prefer running as root/sudo instead of setcap.
+  - **Per-process network bandwidth is not supported** (procfs exposes no
+    per-PID bandwidth; it would require pcap/eBPF + root).
+- NVIDIA support is behind the `nvidia` feature (on by default). `nvml-wrapper`
+  **dlopens `libnvidia-ml` at runtime**, so smtop still builds and runs on hosts
+  without the driver — NVIDIA GPUs simply don't appear.
+- To drop NVML entirely: `cargo build --release --no-default-features`.
 
-## データ取得経路
+## Data sources
 
-| 指標 | ソース |
-|------|--------|
+| Metric | Source |
+|--------|--------|
 | CPU / RAM / load | `/proc/stat`, `/proc/meminfo`, `/proc/loadavg` |
-| AMD GPU | `/sys/class/drm/card*/device/`（`gpu_busy_percent`, `mem_info_vram/gtt_*`, hwmon, `pp_dpm_*`） |
-| NVIDIA GPU | NVML（`nvml-wrapper`） |
+| AMD GPU | `/sys/class/drm/card*/device/` (`gpu_busy_percent`, `mem_info_vram/gtt_*`, hwmon, `pp_dpm_*`) |
+| NVIDIA GPU | NVML (`nvml-wrapper`) |
 | Network | `/proc/net/dev` |
-| Disk I/O | `/proc/diskstats`（物理デバイスのみ） |
-| Free Space | `/proc/mounts` + `statvfs`（応答しないネットワークマウントは500msでタイムアウトし、60秒間スキップして再試行） |
+| Disk I/O | `/proc/diskstats` (physical devices only) |
+| Free Space | `/proc/mounts` + `statvfs` (unresponsive network mounts time out at 500 ms, are skipped for 60 s, then retried) |
 
-各コレクタは専用スレッドで drift-correct ticker により周期収集し、履歴付きスナップショットを `ArcSwap` でロックフリー公開する。UIは独立したFPSで最新値を描画するため、NVMLのストールやCPU高負荷が他指標の更新を妨げない。
+Each collector samples on its own thread with a drift-correcting ticker and
+publishes a history-bearing snapshot lock-free via `ArcSwap`. The UI renders the
+latest values at an independent frame rate, so an NVML stall or high CPU load
+never blocks other metrics from updating.
 
-### AMD GPU の取得経路と注意点
+### AMD GPU details
 
-- 使用率・温度・電力・クロック・ファンは、まず**バイナリ `gpu_metrics` テーブル**（`gpu_metrics_v1_x`、単一 `read()` でデコード）から取得し、無ければレガシー sysfs（`gpu_busy_percent` / hwmon / `pp_dpm_*`）にフォールバックする。新しい discrete カード（例: RDNA4 / Navi 48）はレガシー経路が EBUSY を返すため `gpu_metrics` が主経路、APU はレガシーが主経路。
-- **アイドル時のサスペンド**: discrete カードは無負荷だと runtime PM で D3cold サスペンドし、SMU テレメトリ（使用率/温度/電力/クロック）が読めなくなる（VRAM は読める）。mon はこの状態を `idle (suspended)` と表示する。GPU が実際に使われている間は `runtime_status=active` となりフル取得できる。アイドル時も値が欲しい場合は libdrm の `AMDGPU_INFO` ioctl 経路が必要だが、GPU を毎秒起こしてアイドル電力が上がるため採用していない。
+- Utilization, temperature, power, clock, and fan are read first from the binary
+  **`gpu_metrics` table** (`gpu_metrics_v1_x`, decoded from a single `read()`),
+  falling back to legacy sysfs (`gpu_busy_percent` / hwmon / `pp_dpm_*`) when it
+  isn't present. Newer discrete cards (e.g. RDNA4 / Navi 48) return `EBUSY` on
+  the legacy path, so `gpu_metrics` is the primary source there; APUs use the
+  legacy path as primary.
+- **Idle suspend**: with no load, discrete cards enter D3cold via runtime PM and
+  their SMU telemetry (util/temp/power/clock) becomes unreadable (VRAM still
+  reads). smtop shows this as `idle (suspended)`. While the GPU is actually in
+  use, `runtime_status=active` and the full set reads back. Reading values at
+  idle would require the libdrm `AMDGPU_INFO` ioctl path, but that wakes the GPU
+  every second and raises idle power, so it isn't used.
+- **GPU names** are resolved from `pci.ids`. smtop bundles an AMD-only snapshot
+  compiled into the binary and overlays the host's system `pci.ids` on top
+  (system wins per id, the bundle fills gaps). This guarantees names for recent
+  APU iGPUs (Barcelo, Phoenix, Raphael, Rembrandt, …) even on hosts whose system
+  `pci.ids` predates that hardware, instead of falling back to a raw PCI id.
 
-## 対象環境での確認（mgt-gpu01）
+## Roadmap (not implemented)
 
-```sh
-cargo build --release && ./target/release/mon
-# RTX(NVML) と Radeon(sysfs) が同一画面に同時表示されることを確認
-# 参考: rocm-smi が Radeon を列挙しなくても mon は表示する
-```
+Multi-host aggregation, a config file, and threshold alerts.
 
-## v2（未実装）
+## License
 
-多ホスト集約、設定ファイル、閾値アラート。
+Licensed under the [Apache License, Version 2.0](LICENSE).
+
+The bundled `src/collector/pci_ids_amd.txt` is a subset of the [pci.ids
+database](https://pci-ids.ucw.cz/), redistributed under its BSD terms (pci.ids
+is dual-licensed BSD / GPLv2+); see the file header for attribution.
