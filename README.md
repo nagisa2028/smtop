@@ -117,7 +117,7 @@ never blocks other metrics from updating.
 
 ## Roadmap (not implemented)
 
-Multi-host aggregation, a config file, and threshold alerts.
+A config file and threshold alerts.
 
 ## License
 
