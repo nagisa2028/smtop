@@ -1,5 +1,7 @@
 # smtop
 
+[![CI](https://github.com/nagisa2028/smtop/actions/workflows/ci.yml/badge.svg)](https://github.com/nagisa2028/smtop/actions/workflows/ci.yml)
+
 A single-screen terminal (TUI) node monitor: it shows **every NVIDIA and AMD GPU
 on the box** — multiple cards, no ROCm needed — alongside CPU / RAM /
 Network / Disk I/O / Free Space, with time-series history, all on one screen.
@@ -32,6 +34,12 @@ same screen at a glance.
 
 > Not implemented yet (future): NVMe/drive temperatures and full
 > motherboard-sensor enumeration.
+
+## Install
+
+Download a prebuilt Linux x86_64 binary from the
+[Releases](https://github.com/nagisa2028/smtop/releases) page (built on glibc
+2.35, so it runs on any newer distro), or build from source below.
 
 ## Build / Run
 

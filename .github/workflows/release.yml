@@ -1,0 +1,32 @@
+name: Release
+
+# Cut a release by pushing a tag, e.g.:
+#   git tag v0.1.0 && git push origin v0.1.0
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    # Build on an older image so the glibc floor (2.35) stays broad; the binary
+    # then runs on any newer distro. musl is avoided on purpose: smtop dlopens
+    # libnvidia-ml at runtime and dlopen is unreliable in a static musl binary,
+    # which would silently drop NVIDIA support.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and upload binary to the release
+        uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: smtop
+          target: x86_64-unknown-linux-gnu
+          # Default features (nvidia on; libnvidia-ml is dlopened at runtime).
+          tar: unix
+          checksum: sha256
+          token: ${{ secrets.GITHUB_TOKEN }}
