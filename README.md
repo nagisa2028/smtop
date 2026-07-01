@@ -9,6 +9,11 @@ Few tools put a multi-GPU view and the rest of a node's compute/system
 resources together in one place. Runs the same on single-GPU, multi-GPU,
 single-vendor, or GPU-less hosts.
 
+> **Status:** early solo project (v0.x), built by one developer with AI
+> assistance. Tested on a limited set of hardware, so behavior on other GPUs
+> may differ — bug reports and hardware feedback are very welcome. Provided
+> as-is (see the Apache-2.0 license).
+
 ## Why another monitor?
 
 - **btop** reads AMD GPUs through **ROCm SMI** (as of writing), so it can't
@@ -126,6 +131,14 @@ never blocks other metrics from updating.
 ## Roadmap (not implemented)
 
 A config file and threshold alerts.
+
+## Releases & development
+
+Single trunk: development happens on `master`, which CI keeps green
+(`fmt`/`clippy`/tests on every push). A release is cut by pushing a `vX.Y.Z`
+tag — CI then builds the binary and uploads it to the matching
+[GitHub Release](https://github.com/nagisa2028/smtop/releases). No long-lived
+release branches; fixes land on `master` and go out with the next tag.
 
 ## License
 
