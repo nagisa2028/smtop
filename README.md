@@ -1,13 +1,16 @@
 # smtop
 
-A single-screen terminal (TUI) node monitor for **mixed-GPU machines**
-(NVIDIA RTX + AMD Radeon). It shows CPU / RAM / all GPUs / Network / Disk I/O /
-Free Space together, with time-series history, on one screen.
+A single-screen terminal (TUI) node monitor: it shows **every NVIDIA and AMD GPU
+on the box** — multiple cards, no ROCm needed — alongside CPU / RAM /
+Network / Disk I/O / Free Space, with time-series history, all on one screen.
+Few tools put a multi-GPU view and the rest of a node's compute/system
+resources together in one place. Runs the same on single-GPU, multi-GPU,
+single-vendor, or GPU-less hosts.
 
 ## Why another monitor?
 
-- **btop** reads AMD GPUs through **ROCm SMI**, so it can't enumerate consumer
-  Radeon cards / APUs that ROCm doesn't support.
+- **btop** reads AMD GPUs through **ROCm SMI** (as of writing), so it can't
+  enumerate consumer Radeon cards / APUs that ROCm doesn't support.
 - **nvtop** unifies multiple GPU vendors, but it is **GPU-only** — no CPU,
   network, or disk.
 - The common workaround is to run btop and a GPU tool side by side in tmux.
@@ -22,7 +25,7 @@ same screen at a glance.
    uptime + task counts (running/total) + CPU temperature/clock + RAM/Swap
    gauges + memory breakdown (available/cache).
 2. **GPU** — one card panel per GPU, side by side (util/VRAM history,
-   temperature, power, clock, fan, PCIe; APUs also show GTT).
+   temperature, power, clock, fan, PCIe link width; APUs also show GTT).
 3. **Network | Disk I/O | Free Space** — three columns (rates as time-series
    graphs, capacities as gauges). Network shows link speed/state; Disk shows I/O
    %util and IOPS. Reflows to a vertical stack when the terminal is narrow.
@@ -40,17 +43,20 @@ cargo build --release
 ./target/release/smtop --probe          # one-shot dump without a TTY (handy over SSH)
 ```
 
-- The header shows hostname, time, tabs, and per-collector liveness
-  (green = live / red = not yet published).
+- The header shows hostname, time, tabs, and per-collector liveness: green =
+  fresh, yellow = published but stale (the collector stopped updating — e.g. a
+  driver died — so the on-screen data is frozen), red = never published.
 - Tabs: `Tab`/`1`/`2`/`3` switch **Overview** (dashboard) / **Processes** (PID
   list) / **GPU** (per-GPU nvtop-style detail). `Esc` backs out one level (quits
   on Overview).
   - Processes columns: PID / CPU% / MEM / DISK R / DISK W / **GPU** (which GPU +
     util, e.g. `N0 45%`) / **VRAM** / STATE / COMMAND.
   - Sorting: cycle with `s`, or pick `c` (CPU) / `m` (MEM) / `d` (DISK R) /
-    `D` (DISK W) / `g` (GPU%) / `G` (VRAM) / `p` (PID). `↑↓` scrolls. The active
-    column is marked `▾`.
-  - Per-process GPU: **NVIDIA via NVML for all processes** (VRAM + SM%).
+    `D` (DISK W) / `g` (GPU%) / `G` (VRAM) / `p` (PID); `r` reverses the current
+    sort. `↑↓` (or `j`/`k`) scrolls. The active column is marked `▾` (`▴` when
+    reversed).
+  - Per-process GPU: **NVIDIA via NVML for all processes** (VRAM for all; SM%
+    best-effort, shown where the driver reports it).
     **AMD via `/proc/<pid>/fdinfo`** (`drm-total-vram` / `drm-engine-*`,
     de-duplicated by `drm-pdev` + `drm-client-id`). Like DISK I/O, seeing other
     users' processes needs **root or `setcap cap_sys_ptrace+ep smtop`**.
@@ -75,7 +81,7 @@ cargo build --release
 | Metric | Source |
 |--------|--------|
 | CPU / RAM / load | `/proc/stat`, `/proc/meminfo`, `/proc/loadavg` |
-| AMD GPU | `/sys/class/drm/card*/device/` (`gpu_busy_percent`, `mem_info_vram/gtt_*`, hwmon, `pp_dpm_*`) |
+| AMD GPU | `/sys/class/drm/card*/device/` (binary `gpu_metrics` table first, then legacy `gpu_busy_percent`, `mem_info_vram/gtt_*`, hwmon, `pp_dpm_*`) |
 | NVIDIA GPU | NVML (`nvml-wrapper`) |
 | Network | `/proc/net/dev` |
 | Disk I/O | `/proc/diskstats` (physical devices only) |
@@ -89,11 +95,12 @@ never blocks other metrics from updating.
 ### AMD GPU details
 
 - Utilization, temperature, power, clock, and fan are read first from the binary
-  **`gpu_metrics` table** (`gpu_metrics_v1_x`, decoded from a single `read()`),
-  falling back to legacy sysfs (`gpu_busy_percent` / hwmon / `pp_dpm_*`) when it
-  isn't present. Newer discrete cards (e.g. RDNA4 / Navi 48) return `EBUSY` on
-  the legacy path, so `gpu_metrics` is the primary source there; APUs use the
-  legacy path as primary.
+  **`gpu_metrics` table** (v1.3 layout, decoded from a single `read()`; v1.4+ and
+  APU v2.x aren't decoded and surface an "unsupported" note on the card), falling
+  back to legacy sysfs (`gpu_busy_percent` / hwmon / `pp_dpm_*`) when it isn't
+  present. Newer discrete cards (e.g. RDNA4 / Navi 48) return `EBUSY` on the
+  legacy path, so `gpu_metrics` is the primary source there; APUs use the legacy
+  path as primary.
 - **Idle suspend**: with no load, discrete cards enter D3cold via runtime PM and
   their SMU telemetry (util/temp/power/clock) becomes unreadable (VRAM still
   reads). smtop shows this as `idle (suspended)`. While the GPU is actually in
@@ -102,9 +109,11 @@ never blocks other metrics from updating.
   every second and raises idle power, so it isn't used.
 - **GPU names** are resolved from `pci.ids`. smtop bundles an AMD-only snapshot
   compiled into the binary and overlays the host's system `pci.ids` on top
-  (system wins per id, the bundle fills gaps). This guarantees names for recent
-  APU iGPUs (Barcelo, Phoenix, Raphael, Rembrandt, …) even on hosts whose system
-  `pci.ids` predates that hardware, instead of falling back to a raw PCI id.
+  (system wins per id, the bundle fills gaps). So recent APU iGPUs (Barcelo,
+  Phoenix, Raphael, Rembrandt, …) still resolve on hosts whose system `pci.ids`
+  predates that hardware, instead of falling back to a raw PCI id. (Hardware
+  newer than the bundled snapshot and absent from the system database still
+  falls back.)
 
 ## Roadmap (not implemented)
 
