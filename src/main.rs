@@ -94,6 +94,14 @@ fn spawn_collectors(state: &Arc<SharedState>, shutdown: &Arc<AtomicBool>) {
             move |o| s.amd.store(Some(Arc::new(Stamped::new(o)))),
         );
     }
+    {
+        let s = state.clone();
+        spawn(
+            collector::intel::IntelCollector::new(),
+            shutdown.clone(),
+            move |o| s.intel.store(Some(Arc::new(Stamped::new(o)))),
+        );
+    }
     #[cfg(feature = "nvidia")]
     {
         let s = state.clone();
@@ -181,7 +189,11 @@ fn write_probe<W: Write>(state: &SharedState, out: &mut W) -> std::io::Result<()
             c.load[0]
         );
     }
-    for (label, slot) in [("NVIDIA", &state.nvidia), ("AMD", &state.amd)] {
+    for (label, slot) in [
+        ("NVIDIA", &state.nvidia),
+        ("AMD", &state.amd),
+        ("Intel", &state.intel),
+    ] {
         if let Some(gpus) = slot.load_full() {
             for g in gpus.iter() {
                 probe_line!(
@@ -331,6 +343,31 @@ mod tests {
     #[test]
     fn probe_output_is_sanitized_sorted_and_reports_permissions() {
         let state = SharedState::default();
+        state
+            .intel
+            .store(Some(Arc::new(Stamped::new(vec![model::GpuSnapshot {
+                vendor: model::GpuVendor::Intel,
+                index: 0,
+                name: "UHD Graphics 770".into(),
+                busy_pct: 12.0,
+                util_hist: model::History::new(),
+                mem_used: 0,
+                mem_total: 0,
+                gtt: None,
+                vram_hist: model::History::new(),
+                temp_c: None,
+                power_w: None,
+                sclk_mhz: Some(700),
+                mclk_mhz: None,
+                fan: None,
+                pcie_rx_bps: None,
+                pcie_tx_bps: None,
+                pcie_width: None,
+                enc_pct: None,
+                dec_pct: None,
+                suspended: false,
+                note: None,
+            }]))));
         state.fs.store(Some(Arc::new(Stamped::new(vec![FsSnapshot {
             mount: "/safe\u{1b}[31m\nmount".into(),
             used: 1,
@@ -365,6 +402,7 @@ mod tests {
         assert!(!output.contains('\u{1b}'));
         assert!(!output.contains('\u{7}'));
         assert!(output.contains("n/a (perm)"));
+        assert!(output.contains("Intel[0] UHD Graphics 770"));
         assert!(output.find("high").unwrap() < output.find("low").unwrap());
     }
 }

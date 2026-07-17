@@ -1422,6 +1422,7 @@ dependencies = [
  "arc-swap",
  "chrono",
  "crossterm",
+ "libc",
  "nvml-wrapper",
  "ratatui",
  "rustix",

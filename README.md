@@ -2,8 +2,8 @@
 
 [![CI](https://github.com/nagisa2028/smtop/actions/workflows/ci.yml/badge.svg)](https://github.com/nagisa2028/smtop/actions/workflows/ci.yml)
 
-A single-screen terminal (TUI) node monitor: it shows **every NVIDIA and AMD GPU
-on the box** — multiple cards, no ROCm needed — alongside CPU / RAM /
+A single-screen terminal (TUI) node monitor: it shows **NVIDIA, AMD, and Intel
+GPUs on the box** — multiple cards, no ROCm needed — alongside CPU / RAM /
 Network / Disk I/O / Free Space, with time-series history, all on one screen.
 Few tools put a multi-GPU view and the rest of a node's compute/system
 resources together in one place. Runs the same on single-GPU, multi-GPU,
@@ -22,9 +22,10 @@ single-vendor, or GPU-less hosts.
   network, or disk.
 - The common workaround is to run btop and a GPU tool side by side in tmux.
 
-**smtop** reads AMD via the **amdgpu sysfs interface directly (no ROCm)** and
-NVIDIA via **NVML**, so both vendors — plus the rest of the node — appear on the
-same screen at a glance.
+**smtop** reads AMD via the **amdgpu sysfs interface directly (no ROCm)**,
+Intel via **DRM sysfs and the i915 perf PMU**, and NVIDIA via **NVML**, so all
+three vendors — plus the rest of the node — appear on the same screen at a
+glance.
 
 ## Layout (3 rows)
 
@@ -63,17 +64,18 @@ cargo build --release
   list) / **GPU** (per-GPU nvtop-style detail). `Esc` backs out one level (quits
   on Overview).
   - Processes columns: PID / CPU% / MEM / DISK R / DISK W / **GPU** (which GPU +
-    util, e.g. `N0 45%`) / **VRAM** / STATE / COMMAND.
+    util, e.g. `N0 45%`) / **GPU MEM** / STATE / COMMAND.
   - Sorting: cycle with `s`, or pick `c` (CPU) / `m` (MEM) / `d` (DISK R) /
-    `D` (DISK W) / `g` (GPU%) / `G` (VRAM) / `p` (PID); `r` reverses the current
-    sort. `↑↓` (or `j`/`k`) scrolls. The active column is marked `▾` (`▴` when
-    reversed).
+    `D` (DISK W) / `g` (GPU%) / `G` (GPU memory) / `p` (PID); `r` reverses the
+    current sort. `↑↓` (or `j`/`k`) scrolls. The active column is marked `▾`
+    (`▴` when reversed).
   - Per-process GPU: **NVIDIA via NVML for all processes** (VRAM for all; SM%
     best-effort, shown where the driver reports it).
-    **AMD via `/proc/<pid>/fdinfo`** (`drm-total-vram` / `drm-engine-*`,
-    de-duplicated by `drm-pdev` + `drm-client-id`). Like DISK I/O, seeing other
-    users' processes needs **root or `setcap cap_sys_ptrace+ep smtop`**.
-    Utilization is reported only while active (idle = 0).
+    **AMD and Intel i915 via `/proc/<pid>/fdinfo`** (`drm-total-vram` or
+    `drm-total-system*` / `drm-engine-*`, de-duplicated by `drm-pdev` +
+    `drm-client-id`). Like DISK I/O, seeing other users' processes needs **root
+    or `setcap cap_sys_ptrace+ep smtop`**. Utilization is reported only while
+    active (idle = 0).
   - DISK I/O comes from `/proc/<pid>/io`. Other users' processes need **root or
     `setcap cap_sys_ptrace+ep smtop`** (otherwise only your own processes are
     shown; the rest are `n/a`).
@@ -95,6 +97,7 @@ cargo build --release
 |--------|--------|
 | CPU / RAM / load | `/proc/stat`, `/proc/meminfo`, `/proc/loadavg` |
 | AMD GPU | `/sys/class/drm/card*/device/` (binary `gpu_metrics` table first, then legacy `gpu_busy_percent`, `mem_info_vram/gtt_*`, hwmon, `pp_dpm_*`) |
+| Intel GPU | `/sys/class/drm/card*/` (identity, runtime PM, GT frequency, hwmon where exposed) + i915 perf PMU (engine busy) |
 | NVIDIA GPU | NVML (`nvml-wrapper`) |
 | Network | `/proc/net/dev` |
 | Disk I/O | `/proc/diskstats` (physical devices only) |
@@ -127,6 +130,24 @@ never blocks other metrics from updating.
   predates that hardware, instead of falling back to a raw PCI id. (Hardware
   newer than the bundled snapshot and absent from the system database still
   falls back.)
+
+### Intel GPU details
+
+- i915 cards are discovered through DRM sysfs. GT frequency comes from
+  `gt/gt0/rps_*_freq_mhz`; engine utilization is the busiest i915 PMU engine
+  (`render`, `copy`, `video`, or `video-enhance`). The first sample establishes
+  the PMU baseline and reports 0%; subsequent samples use counter deltas.
+- Many distributions restrict system-wide perf counters. If an active Intel
+  card shows `util requires CAP_PERFMON`, run with `sudo`, relax the system's
+  `kernel.perf_event_paranoid` policy, or grant only the required capability
+  with `sudo setcap cap_perfmon+ep ./target/release/smtop`. Identity, clock, and
+  runtime-PM state remain available without that capability.
+- Intel iGPUs use shared system memory, so the card-wide VRAM gauge is left
+  unavailable rather than treating all RAM as dedicated VRAM. Per-process
+  shared GPU memory is still read from i915 fdinfo as `drm-total-system*`.
+- The newer Xe driver is detected and its per-GT frequency is shown on a
+  best-effort basis. Xe PMU utilization and Xe's cycle-based per-process
+  accounting are not yet implemented because no Xe hardware has been validated.
 
 ## Roadmap (not implemented)
 

@@ -1,9 +1,9 @@
 //! Per-process GPU usage (P2): VRAM + utilization per PID.
 //!
-//! NVIDIA via NVML (sees all processes, no root needed). AMD via amdgpu
+//! NVIDIA via NVML (sees all processes, no root needed). AMD and Intel i915 via
 //! `/proc/<pid>/fdinfo` (own processes only unless root/CAP_SYS_PTRACE),
-//! de-duplicated by `drm-pdev` + `drm-client-id`, with utilization from
-//! `drm-engine-*` ns deltas.
+//! de-duplicated by `drm-pdev` + `drm-client-id`, with utilization from the
+//! standardized `drm-engine-*` ns deltas.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -31,6 +31,9 @@ pub struct GpuProcCollector {
     amd_prev: HashMap<(i32, u64), u64>,
     /// drm-pdev (e.g. "0000:05:00.0") -> amd GPU index.
     amd_pdev_idx: HashMap<String, usize>,
+    /// Intel i915 counterpart to the AMD fdinfo delta/index state.
+    intel_prev: HashMap<(i32, u64), u64>,
+    intel_pdev_idx: HashMap<String, usize>,
     last: Option<Instant>,
 }
 
@@ -43,6 +46,8 @@ impl GpuProcCollector {
             nv_last_ts: HashMap::new(),
             amd_prev: HashMap::new(),
             amd_pdev_idx: amd_pdev_index(),
+            intel_prev: HashMap::new(),
+            intel_pdev_idx: intel_pdev_index(),
             last: None,
         }
     }
@@ -72,14 +77,25 @@ impl Collector for GpuProcCollector {
         let mut out: HashMap<i32, GpuProcUse> = HashMap::new();
 
         let mut amd_cur: HashMap<(i32, u64), u64> = HashMap::new();
-        collect_amdgpu(
-            &self.amd_pdev_idx,
-            &self.amd_prev,
+        let mut intel_cur: HashMap<(i32, u64), u64> = HashMap::new();
+        collect_drm(
+            VendorScan {
+                prefix: "A",
+                pdev_idx: &self.amd_pdev_idx,
+                prev: &self.amd_prev,
+                cur: &mut amd_cur,
+            },
+            VendorScan {
+                prefix: "I",
+                pdev_idx: &self.intel_pdev_idx,
+                prev: &self.intel_prev,
+                cur: &mut intel_cur,
+            },
             dt,
             &mut out,
-            &mut amd_cur,
         );
         self.amd_prev = amd_cur;
+        self.intel_prev = intel_cur;
 
         #[cfg(feature = "nvidia")]
         if let Some(nvml) = self.nvml.as_ref() {
@@ -93,6 +109,14 @@ impl Collector for GpuProcCollector {
 /// Map each amdgpu card's PCI address to its enumeration index (matching the
 /// AMD device collector's ordering).
 fn amd_pdev_index() -> HashMap<String, usize> {
+    pdev_index(&["amdgpu"])
+}
+
+fn intel_pdev_index() -> HashMap<String, usize> {
+    pdev_index(&["i915", "xe"])
+}
+
+fn pdev_index(drivers: &[&str]) -> HashMap<String, usize> {
     let mut cards: Vec<(String, String)> = Vec::new();
     if let Ok(rd) = fs::read_dir("/sys/class/drm") {
         for e in rd.flatten() {
@@ -106,7 +130,10 @@ fn amd_pdev_index() -> HashMap<String, usize> {
             }
             let dev = e.path().join("device");
             let uevent = fs::read_to_string(dev.join("uevent")).unwrap_or_default();
-            if !uevent.lines().any(|l| l == "DRIVER=amdgpu") {
+            if !uevent.lines().any(|l| {
+                l.strip_prefix("DRIVER=")
+                    .is_some_and(|driver| drivers.contains(&driver))
+            }) {
                 continue;
             }
             let pdev = fs::canonicalize(&dev)
@@ -124,19 +151,27 @@ fn amd_pdev_index() -> HashMap<String, usize> {
         .collect()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DrmVendor {
+    Amd,
+    Intel,
+}
+
 struct FdInfo {
+    vendor: DrmVendor,
     client_id: u64,
     pdev: String,
-    vram: u64,
+    memory: u64,
     engine_ns: u64,
 }
 
-/// Parse one `/proc/<pid>/fdinfo/<fd>` for an amdgpu DRM client.
+/// Parse one `/proc/<pid>/fdinfo/<fd>` for an amdgpu or i915 DRM client.
 fn parse_fdinfo(content: &str) -> Option<FdInfo> {
     let mut driver = "";
     let mut client_id = None;
     let mut pdev = String::new();
     let mut vram = 0;
+    let mut system = 0;
     // Per drm-usage-stats: any `drm-engine-<name>` reports busy ns for that
     // engine, and an optional `drm-engine-capacity-<name>` gives how many
     // parallel units it has (default 1). Utilization normalizes each engine's
@@ -153,6 +188,7 @@ fn parse_fdinfo(content: &str) -> Option<FdInfo> {
             "drm-client-id" => client_id = v.parse().ok(),
             "drm-pdev" => pdev = v.to_string(),
             "drm-total-vram" => vram = parse_size(v),
+            k if k.starts_with("drm-total-system") => system += parse_size(v),
             // Check the capacity prefix first: `drm-engine-capacity-<name>`
             // also matches the `drm-engine-` prefix.
             k => {
@@ -164,9 +200,11 @@ fn parse_fdinfo(content: &str) -> Option<FdInfo> {
             }
         }
     }
-    if driver != "amdgpu" {
-        return None;
-    }
+    let (vendor, memory) = match driver {
+        "amdgpu" => (DrmVendor::Amd, vram),
+        "i915" => (DrmVendor::Intel, system),
+        _ => return None,
+    };
     // Sum capacity-normalized busy ns across every engine (gfx/compute/dec/enc/
     // sdma/…). Capacity is constant over time, so a single summed value keeps
     // the downstream ns-delta math unchanged. Integer division drops
@@ -176,9 +214,10 @@ fn parse_fdinfo(content: &str) -> Option<FdInfo> {
         .map(|(name, &ns)| ns / capacities.get(name).copied().unwrap_or(1).max(1))
         .sum();
     Some(FdInfo {
+        vendor,
         client_id: client_id?,
         pdev,
-        vram,
+        memory,
         engine_ns,
     })
 }
@@ -204,23 +243,51 @@ fn parse_leading_u64(v: &str) -> u64 {
         .unwrap_or(0)
 }
 
-fn collect_amdgpu(
-    pdev_idx: &HashMap<String, usize>,
-    prev: &HashMap<(i32, u64), u64>,
-    dt: Option<f64>,
-    out: &mut HashMap<i32, GpuProcUse>,
-    cur: &mut HashMap<(i32, u64), u64>,
-) {
-    collect_amdgpu_at(Path::new("/proc"), pdev_idx, prev, dt, out, cur);
+struct VendorScan<'a> {
+    prefix: &'static str,
+    pdev_idx: &'a HashMap<String, usize>,
+    prev: &'a HashMap<(i32, u64), u64>,
+    cur: &'a mut HashMap<(i32, u64), u64>,
 }
 
-fn collect_amdgpu_at(
-    proc_root: &Path,
-    pdev_idx: &HashMap<String, usize>,
-    prev: &HashMap<(i32, u64), u64>,
+fn collect_drm(
+    amd: VendorScan<'_>,
+    intel: VendorScan<'_>,
     dt: Option<f64>,
     out: &mut HashMap<i32, GpuProcUse>,
-    cur: &mut HashMap<(i32, u64), u64>,
+) {
+    collect_drm_at(Path::new("/proc"), amd, intel, dt, out);
+}
+
+#[derive(Default)]
+struct ProcDrmUsage {
+    seen: HashSet<(String, u64)>,
+    memory: u64,
+    engine_ns: u64,
+    indices: Vec<usize>,
+}
+
+impl ProcDrmUsage {
+    fn add(&mut self, info: &FdInfo, pdev_idx: &HashMap<String, usize>) {
+        if !self.seen.insert(fdinfo_client_key(info)) {
+            return;
+        }
+        self.memory += info.memory;
+        self.engine_ns += info.engine_ns;
+        if let Some(&index) = pdev_idx.get(&info.pdev)
+            && !self.indices.contains(&index)
+        {
+            self.indices.push(index);
+        }
+    }
+}
+
+fn collect_drm_at(
+    proc_root: &Path,
+    mut amd_scan: VendorScan<'_>,
+    mut intel_scan: VendorScan<'_>,
+    dt: Option<f64>,
+    out: &mut HashMap<i32, GpuProcUse>,
 ) {
     let Ok(procs) = fs::read_dir(proc_root) else {
         return;
@@ -237,10 +304,8 @@ fn collect_amdgpu_at(
         let Ok(fds) = fs::read_dir(proc_dir.join("fd")) else {
             continue;
         };
-        let mut seen: HashSet<(String, u64)> = HashSet::new();
-        let mut vram = 0u64;
-        let mut engine = 0u64;
-        let mut indices: Vec<usize> = Vec::new();
+        let mut amd = ProcDrmUsage::default();
+        let mut intel = ProcDrmUsage::default();
         for fd in fds.flatten() {
             let Ok(target) = fs::read_link(fd.path()) else {
                 continue;
@@ -255,30 +320,94 @@ fn collect_amdgpu_at(
             let Some(info) = parse_fdinfo(&content) else {
                 continue;
             };
-            if !seen.insert(fdinfo_client_key(&info)) {
-                continue; // same GPU client via another fd
+            match info.vendor {
+                DrmVendor::Amd => amd.add(&info, amd_scan.pdev_idx),
+                DrmVendor::Intel => intel.add(&info, intel_scan.pdev_idx),
             }
-            vram += info.vram;
-            engine += info.engine_ns;
-            if let Some(&idx) = pdev_idx.get(&info.pdev)
-                && !indices.contains(&idx)
-            {
-                indices.push(idx);
-            }
-        }
-        if seen.is_empty() {
-            continue;
         }
         let key = (pid, super::proc::read_starttime_at(proc_root, pid));
-        cur.insert(key, engine);
-        let util = amd_util(prev.get(&key).copied(), engine, dt);
-        indices.sort_unstable();
-        merge_gpu_use(out, pid, vram, util, "");
-        let e = out.entry(pid).or_default();
-        for i in &indices {
-            add_gpu_label(e, &format!("A{i}"));
-        }
+        finish_drm_usage(pid, key, amd, &mut amd_scan, dt, out);
+        finish_drm_usage(pid, key, intel, &mut intel_scan, dt, out);
     }
+}
+
+fn finish_drm_usage(
+    pid: i32,
+    key: (i32, u64),
+    mut usage: ProcDrmUsage,
+    scan: &mut VendorScan<'_>,
+    dt: Option<f64>,
+    out: &mut HashMap<i32, GpuProcUse>,
+) {
+    if usage.seen.is_empty() {
+        return;
+    }
+    scan.cur.insert(key, usage.engine_ns);
+    let util = amd_util(scan.prev.get(&key).copied(), usage.engine_ns, dt);
+    merge_gpu_use(out, pid, usage.memory, util, "");
+    usage.indices.sort_unstable();
+    let output = out.entry(pid).or_default();
+    for index in usage.indices {
+        add_gpu_label(output, &format!("{}{index}", scan.prefix));
+    }
+}
+
+#[cfg(test)]
+fn collect_amdgpu_at(
+    proc_root: &Path,
+    pdev_idx: &HashMap<String, usize>,
+    prev: &HashMap<(i32, u64), u64>,
+    dt: Option<f64>,
+    out: &mut HashMap<i32, GpuProcUse>,
+    cur: &mut HashMap<(i32, u64), u64>,
+) {
+    let mut ignored = HashMap::new();
+    collect_drm_at(
+        proc_root,
+        VendorScan {
+            prefix: "A",
+            pdev_idx,
+            prev,
+            cur,
+        },
+        VendorScan {
+            prefix: "I",
+            pdev_idx: &HashMap::new(),
+            prev: &HashMap::new(),
+            cur: &mut ignored,
+        },
+        dt,
+        out,
+    );
+}
+
+#[cfg(test)]
+fn collect_intel_at(
+    proc_root: &Path,
+    pdev_idx: &HashMap<String, usize>,
+    prev: &HashMap<(i32, u64), u64>,
+    dt: Option<f64>,
+    out: &mut HashMap<i32, GpuProcUse>,
+    cur: &mut HashMap<(i32, u64), u64>,
+) {
+    let mut ignored = HashMap::new();
+    collect_drm_at(
+        proc_root,
+        VendorScan {
+            prefix: "A",
+            pdev_idx: &HashMap::new(),
+            prev: &HashMap::new(),
+            cur: &mut ignored,
+        },
+        VendorScan {
+            prefix: "I",
+            pdev_idx,
+            prev,
+            cur,
+        },
+        dt,
+        out,
+    );
 }
 
 fn merge_gpu_use(
@@ -426,15 +555,17 @@ mod tests {
     #[test]
     fn amd_fdinfo_dedup_key_includes_pci_device() {
         let a = FdInfo {
+            vendor: DrmVendor::Amd,
             client_id: 7,
             pdev: "0000:05:00.0".into(),
-            vram: 0,
+            memory: 0,
             engine_ns: 0,
         };
         let b = FdInfo {
+            vendor: DrmVendor::Amd,
             client_id: 7,
             pdev: "0000:06:00.0".into(),
-            vram: 0,
+            memory: 0,
             engine_ns: 0,
         };
 
@@ -456,14 +587,45 @@ drm-engine-capacity-dec:\t2
         let info = parse_fdinfo(content).expect("amdgpu fdinfo");
         // gfx(1000) + compute(2000) + dec(800/2=400) = 3400
         assert_eq!(info.engine_ns, 3400);
+        assert_eq!(info.vendor, DrmVendor::Amd);
         assert_eq!(info.client_id, 42);
-        assert_eq!(info.vram, 10240 * 1024);
+        assert_eq!(info.memory, 10240 * 1024);
     }
 
     #[test]
-    fn amd_fdinfo_rejects_other_drivers_and_missing_client() {
-        assert!(parse_fdinfo("drm-driver: i915\ndrm-client-id: 1").is_none());
+    fn drm_fdinfo_rejects_unsupported_drivers_and_missing_client() {
+        assert!(parse_fdinfo("drm-driver: xe\ndrm-client-id: 1").is_none());
         assert!(parse_fdinfo("drm-driver: amdgpu\ndrm-pdev: 0000:01:00.0").is_none());
+        assert!(parse_fdinfo("drm-driver: i915\ndrm-pdev: 0000:00:02.0").is_none());
+    }
+
+    #[test]
+    fn intel_fdinfo_sums_system_memory_and_capacity_normalized_engines() {
+        let content = "\
+drm-driver:\ti915
+drm-client-id:\t17
+drm-pdev:\t0000:00:02.0
+drm-total-system0:\t54020 KiB
+drm-total-stolen-system0:\t1024 KiB
+drm-engine-render:\t1000000000 ns
+drm-engine-video:\t2000000000 ns
+drm-engine-capacity-video:\t2
+";
+        let info = parse_fdinfo(content).expect("i915 fdinfo");
+        assert_eq!(info.vendor, DrmVendor::Intel);
+        assert_eq!(info.client_id, 17);
+        assert_eq!(info.pdev, "0000:00:02.0");
+        assert_eq!(info.memory, 54020 * 1024);
+        assert_eq!(info.engine_ns, 2_000_000_000);
+    }
+
+    #[test]
+    fn intel_fdinfo_ignores_stolen_memory() {
+        let info = parse_fdinfo(
+            "drm-driver: i915\ndrm-client-id: 1\ndrm-total-system0: 2 MiB\ndrm-total-stolen-system0: 4 MiB",
+        )
+        .unwrap();
+        assert_eq!(info.memory, 2 * 1024 * 1024);
     }
 
     #[test]
@@ -517,6 +679,100 @@ drm-engine-capacity-dec:\t2
         assert_eq!(usage.util_pct, 100.0);
         assert_eq!(usage.label, "A0,A1");
         assert_eq!(cur.get(&(42, 999)), Some(&3_000_000_000));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn intel_collection_deduplicates_client_and_computes_delta() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TestDir::new();
+        let proc_dir = tmp.0.join("43");
+        fs::create_dir_all(proc_dir.join("fd")).unwrap();
+        fs::create_dir_all(proc_dir.join("fdinfo")).unwrap();
+        fs::write(
+            proc_dir.join("stat"),
+            "43 (intel worker) S 1 2 3 4 5 6 7 8 9 10 0 0 13 14 15 16 17 18 777",
+        )
+        .unwrap();
+
+        let info = "drm-driver: i915\ndrm-client-id: 17\ndrm-pdev: 0000:00:02.0\ndrm-total-system0: 54 MiB\ndrm-engine-render: 2000000000 ns\ndrm-engine-video: 2000000000 ns\ndrm-engine-capacity-video: 2\n";
+        for fd in ["3", "4"] {
+            symlink("/dev/dri/renderD128", proc_dir.join("fd").join(fd)).unwrap();
+            fs::write(proc_dir.join("fdinfo").join(fd), info).unwrap();
+        }
+
+        let pdev = HashMap::from([("0000:00:02.0".to_string(), 0)]);
+        let prev = HashMap::from([((43, 777), 2_000_000_000)]);
+        let mut out = HashMap::new();
+        let mut cur = HashMap::new();
+        collect_intel_at(&tmp.0, &pdev, &prev, Some(1.0), &mut out, &mut cur);
+
+        let usage = out.get(&43).unwrap();
+        assert_eq!(usage.vram, 54 * 1024 * 1024);
+        assert_eq!(usage.util_pct, 100.0);
+        assert_eq!(usage.label, "I0");
+        assert_eq!(cur.get(&(43, 777)), Some(&3_000_000_000));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn combined_drm_scan_keeps_vendor_baselines_and_labels_separate() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TestDir::new();
+        let proc_dir = tmp.0.join("44");
+        fs::create_dir_all(proc_dir.join("fd")).unwrap();
+        fs::create_dir_all(proc_dir.join("fdinfo")).unwrap();
+        fs::write(
+            proc_dir.join("stat"),
+            "44 (mixed gpu) S 1 2 3 4 5 6 7 8 9 10 0 0 13 14 15 16 17 18 888",
+        )
+        .unwrap();
+        for (fd, info) in [
+            (
+                "3",
+                "drm-driver: amdgpu\ndrm-client-id: 7\ndrm-pdev: 0000:05:00.0\ndrm-total-vram: 10 MiB\ndrm-engine-gfx: 2000000000 ns\n",
+            ),
+            (
+                "4",
+                "drm-driver: i915\ndrm-client-id: 7\ndrm-pdev: 0000:00:02.0\ndrm-total-system0: 20 MiB\ndrm-engine-render: 3000000000 ns\n",
+            ),
+        ] {
+            symlink("/dev/dri/renderD128", proc_dir.join("fd").join(fd)).unwrap();
+            fs::write(proc_dir.join("fdinfo").join(fd), info).unwrap();
+        }
+
+        let amd_pdev = HashMap::from([("0000:05:00.0".to_string(), 0)]);
+        let intel_pdev = HashMap::from([("0000:00:02.0".to_string(), 0)]);
+        let amd_prev = HashMap::from([((44, 888), 1_000_000_000)]);
+        let intel_prev = HashMap::from([((44, 888), 2_000_000_000)]);
+        let mut out = HashMap::new();
+        let mut amd_cur = HashMap::new();
+        let mut intel_cur = HashMap::new();
+        collect_drm_at(
+            &tmp.0,
+            VendorScan {
+                prefix: "A",
+                pdev_idx: &amd_pdev,
+                prev: &amd_prev,
+                cur: &mut amd_cur,
+            },
+            VendorScan {
+                prefix: "I",
+                pdev_idx: &intel_pdev,
+                prev: &intel_prev,
+                cur: &mut intel_cur,
+            },
+            Some(1.0),
+            &mut out,
+        );
+
+        assert_eq!(out[&44].vram, 30 * 1024 * 1024);
+        assert_eq!(out[&44].util_pct, 200.0);
+        assert_eq!(out[&44].label, "A0,I0");
+        assert_eq!(amd_cur[&(44, 888)], 2_000_000_000);
+        assert_eq!(intel_cur[&(44, 888)], 3_000_000_000);
     }
 
     #[test]

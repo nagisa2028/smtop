@@ -138,9 +138,10 @@ mod tests {
 pub enum GpuVendor {
     Nvidia,
     Amd,
+    Intel,
 }
 
-/// Fan reading, normalized per vendor (NVIDIA reports %, AMD reports RPM).
+/// Fan reading, normalized per driver (NVIDIA usually reports %, DRM hwmon RPM).
 #[derive(Clone, Copy, Debug)]
 #[cfg_attr(not(feature = "nvidia"), allow(dead_code))]
 pub enum Fan {
@@ -274,12 +275,13 @@ pub struct ProcInfo {
 /// Per-process GPU usage, aggregated across the GPUs a process touches.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GpuProcUse {
-    /// VRAM used by the process (bytes).
+    /// GPU-addressable memory used by the process (dedicated VRAM or shared
+    /// system memory for an integrated GPU), in bytes.
     pub vram: u64,
-    /// GPU utilization attributed to the process (percent; NVIDIA SM% / AMD
+    /// GPU utilization attributed to the process (percent; NVIDIA SM% or DRM
     /// engine busy). 0 when unavailable.
     pub util_pct: f32,
-    /// Which GPU(s), e.g. "N0" (NVIDIA 0) or "A0" (AMD 0).
+    /// Which GPU(s), e.g. "N0" (NVIDIA 0), "A0" (AMD 0), or "I0" (Intel 0).
     pub label: String,
 }
 
@@ -289,11 +291,12 @@ pub struct GpuProcUse {
 pub struct SharedState {
     pub cpu: ArcSwapOption<Stamped<CpuSnapshot>>,
     pub amd: ArcSwapOption<Stamped<Vec<GpuSnapshot>>>,
+    pub intel: ArcSwapOption<Stamped<Vec<GpuSnapshot>>>,
     pub nvidia: ArcSwapOption<Stamped<Vec<GpuSnapshot>>>,
     pub net: ArcSwapOption<Stamped<Vec<NetSnapshot>>>,
     pub disk: ArcSwapOption<Stamped<Vec<DiskSnapshot>>>,
     pub fs: ArcSwapOption<Stamped<Vec<FsSnapshot>>>,
     pub procs: ArcSwapOption<Stamped<Vec<ProcInfo>>>,
-    /// pid -> aggregated GPU usage (NVML + amdgpu fdinfo).
+    /// pid -> aggregated GPU usage (NVML + DRM fdinfo).
     pub gpu_procs: ArcSwapOption<Stamped<HashMap<i32, GpuProcUse>>>,
 }

@@ -93,7 +93,7 @@ impl ProcSort {
             ProcSort::DiskRead => "DISK R",
             ProcSort::DiskWrite => "DISK W",
             ProcSort::GpuPct => "GPU",
-            ProcSort::GpuVram => "VRAM",
+            ProcSort::GpuVram => "GPU MEM",
             ProcSort::Pid => "PID",
         }
     }
@@ -107,7 +107,7 @@ struct View {
     proc_sort: ProcSort,
     /// Reverse (ascending) the active process sort.
     proc_rev: bool,
-    /// Selected GPU index (combined nvidia→amd order) on the GPU tab.
+    /// Selected GPU index (combined nvidia→amd→intel order) on the GPU tab.
     gpu_sel: usize,
 }
 
@@ -305,11 +305,12 @@ fn render(frame: &mut Frame, state: &SharedState, view: &View) {
     }
 }
 
-/// Number of GPUs across both vendors (combined nvidia→amd order).
+/// Number of GPUs across all vendors (combined nvidia→amd→intel order).
 fn gpu_count(state: &SharedState) -> usize {
     let nv = state.nvidia.load_full().map_or(0, |g| g.len());
     let amd = state.amd.load_full().map_or(0, |g| g.len());
-    nv + amd
+    let intel = state.intel.load_full().map_or(0, |g| g.len());
+    nv + amd + intel
 }
 
 fn render_overview(frame: &mut Frame, area: Rect, state: &SharedState) {
@@ -339,9 +340,11 @@ fn render_overview(frame: &mut Frame, area: Rect, state: &SharedState) {
 
     let nvidia = state.nvidia.load_full();
     let amd = state.amd.load_full();
+    let intel = state.intel.load_full();
     let gpus = collect_gpus(
         nvidia.as_deref().map(|g| g.as_slice()).unwrap_or(&[]),
         amd.as_deref().map(|g| g.as_slice()).unwrap_or(&[]),
+        intel.as_deref().map(|g| g.as_slice()).unwrap_or(&[]),
     );
     render_gpus(frame, tiers[1], &gpus);
 
@@ -357,10 +360,13 @@ fn render_overview(frame: &mut Frame, area: Rect, state: &SharedState) {
     );
 }
 
-/// Combined GPU list across both vendors, nvidia first then amd (the order the
-/// `index`/tag scheme and the Overview cards use).
-fn collect_gpus<'a>(nvidia: &'a [GpuSnapshot], amd: &'a [GpuSnapshot]) -> Vec<&'a GpuSnapshot> {
-    nvidia.iter().chain(amd).collect()
+/// Combined GPU list in stable vendor order (the order the Overview uses).
+fn collect_gpus<'a>(
+    nvidia: &'a [GpuSnapshot],
+    amd: &'a [GpuSnapshot],
+    intel: &'a [GpuSnapshot],
+) -> Vec<&'a GpuSnapshot> {
+    nvidia.iter().chain(amd).chain(intel).collect()
 }
 
 /// The per-process GPU tag a snapshot corresponds to (`N0`, `A1`, …), matching
@@ -369,6 +375,7 @@ fn gpu_tag(g: &GpuSnapshot) -> String {
     let v = match g.vendor {
         GpuVendor::Nvidia => 'N',
         GpuVendor::Amd => 'A',
+        GpuVendor::Intel => 'I',
     };
     format!("{v}{}", g.index)
 }
@@ -403,9 +410,11 @@ fn procs_for_gpu<'a>(
 fn render_gpu_tab(frame: &mut Frame, area: Rect, state: &SharedState, view: &View) {
     let nvidia = state.nvidia.load_full();
     let amd = state.amd.load_full();
+    let intel = state.intel.load_full();
     let gpus = collect_gpus(
         nvidia.as_deref().map(|g| g.as_slice()).unwrap_or(&[]),
         amd.as_deref().map(|g| g.as_slice()).unwrap_or(&[]),
+        intel.as_deref().map(|g| g.as_slice()).unwrap_or(&[]),
     );
     if gpus.is_empty() {
         let block = Block::bordered().title(" GPU ".bold());
@@ -448,6 +457,7 @@ fn render_gpu_band(
     let (color, sym) = match g.vendor {
         GpuVendor::Nvidia => (Color::Green, "⬢"),
         GpuVendor::Amd => (Color::Red, "⬡"),
+        GpuVendor::Intel => (Color::Blue, "◆"),
     };
     // The selected band is bright; the rest are dimmed so the cursor reads.
     let border_style = if selected {
@@ -538,7 +548,7 @@ fn gpu_telemetry_line(g: &GpuSnapshot) -> Line<'static> {
         Some(Fan::Rpm(r)) => spans.push(Span::raw(format!("  fan {r}rpm"))),
         None => {}
     }
-    // enc/dec: NVIDIA reports values; AMD has none (—).
+    // enc/dec: NVIDIA reports values; current DRM collectors show none (—).
     let fmt = |v: Option<f32>| v.map(|x| format!("{x:.0}%")).unwrap_or_else(|| "—".into());
     spans.push(Span::styled(
         format!("  enc {} dec {}", fmt(g.enc_pct), fmt(g.dec_pct)),
@@ -553,7 +563,7 @@ fn gpu_telemetry_line(g: &GpuSnapshot) -> Line<'static> {
     Line::from(spans)
 }
 
-/// The selected GPU band's process list: PID / GPU% / VRAM / COMMAND.
+/// The selected GPU band's process list: PID / GPU% / GPU memory / COMMAND.
 fn render_gpu_procs(
     frame: &mut Frame,
     area: Rect,
@@ -571,7 +581,10 @@ fn render_gpu_procs(
 
     let cmd_w = (area.width as usize).saturating_sub(24).max(4);
     let mut lines = vec![Line::from(Span::styled(
-        format!("  {:>6} {:>5} {:>7}  {}", "PID", "GPU%", "VRAM", "COMMAND"),
+        format!(
+            "  {:>6} {:>5} {:>7}  {}",
+            "PID", "GPU%", "GPU MEM", "COMMAND"
+        ),
         Style::new().add_modifier(Modifier::DIM),
     ))];
     if rows.is_empty() {
@@ -771,11 +784,15 @@ fn render_header(frame: &mut Frame, area: Rect, state: &SharedState, view: &View
     // data on screen is frozen), red = never published.
     let base = crate::collector::sample_interval();
     let freshness_now = std::time::Instant::now();
-    let gpu_at = [state.nvidia.load_full(), state.amd.load_full()]
-        .into_iter()
-        .flatten()
-        .map(|s| s.at)
-        .max();
+    let gpu_at = [
+        state.nvidia.load_full(),
+        state.amd.load_full(),
+        state.intel.load_full(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|s| s.at)
+    .max();
     spans.push(Span::raw(" "));
     for (label, at, mult) in [
         ("cpu", state.cpu.load_full().map(|s| s.at), 3u32),
@@ -858,7 +875,7 @@ fn render_processes(frame: &mut Frame, area: Rect, state: &SharedState, view: &V
         list.reverse();
     }
 
-    // Fixed columns: PID(7) CPU(5) MEM(9) DISK_R(8) DISK_W(8) GPU(9) VRAM(8) S(1).
+    // Fixed columns: PID(7) CPU(5) MEM(9) DISK_R(8) DISK_W(8) GPU(9) GPU_MEM(8) S(1).
     let cmd_w = (inner.width as usize).saturating_sub(63).max(4);
     let base = Style::new().add_modifier(Modifier::REVERSED);
     let active = Style::new()
@@ -906,7 +923,7 @@ fn render_processes(frame: &mut Frame, area: Rect, state: &SharedState, view: &V
         ),
         Span::styled(" ", base),
         col(
-            format!("{:>7}{}", "VRAM", mark(ProcSort::GpuVram)),
+            format!("{:>7}{}", "GPU MEM", mark(ProcSort::GpuVram)),
             ProcSort::GpuVram,
         ),
         Span::styled(" S ", base),
@@ -1126,7 +1143,7 @@ fn render_gpus(frame: &mut Frame, area: Rect, gpus: &[&GpuSnapshot]) {
         let inner = block.inner(area);
         frame.render_widget(block, area);
         frame.render_widget(
-            Paragraph::new("No GPUs detected (NVIDIA via NVML / AMD via amdgpu sysfs)".dim()),
+            Paragraph::new("No GPUs detected (NVIDIA NVML / AMD amdgpu / Intel i915 sysfs)".dim()),
             inner,
         );
         return;
@@ -1151,6 +1168,7 @@ fn render_gpu_card(frame: &mut Frame, area: Rect, g: &GpuSnapshot) {
     let (color, sym) = match g.vendor {
         GpuVendor::Nvidia => (Color::Green, "⬢"),
         GpuVendor::Amd => (Color::Red, "⬡"),
+        GpuVendor::Intel => (Color::Blue, "◆"),
     };
     let block = Block::bordered()
         .border_style(Style::new().fg(color))
@@ -1930,7 +1948,7 @@ mod tests {
     }
 
     #[test]
-    fn gpu_tab_renders_both_vendors() {
+    fn gpu_tab_renders_all_vendors() {
         let state = SharedState::default();
         state
             .nvidia
@@ -1946,6 +1964,13 @@ mod tests {
                 0,
                 "RADEON_TEST",
             )]))));
+        state
+            .intel
+            .store(Some(std::sync::Arc::new(Stamped::new(vec![gpu_snap(
+                GpuVendor::Intel,
+                0,
+                "INTEL_TEST",
+            )]))));
         let view = View {
             tab: Tab::Gpu,
             ..View::default()
@@ -1953,6 +1978,7 @@ mod tests {
         let text = full_to_text(&state, &view, 90, 24);
         assert!(text.contains("RTX_TEST"), "nvidia band missing:\n{text}");
         assert!(text.contains("RADEON_TEST"), "amd band missing:\n{text}");
+        assert!(text.contains("INTEL_TEST"), "intel band missing:\n{text}");
     }
 
     #[test]

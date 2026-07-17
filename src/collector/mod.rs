@@ -44,6 +44,7 @@ pub mod cpu;
 pub mod disk;
 pub mod fs;
 pub mod gpuproc;
+pub mod intel;
 pub mod net;
 #[cfg(feature = "nvidia")]
 pub mod nvidia;
