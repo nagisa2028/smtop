@@ -33,3 +33,8 @@ jobs:
         run: cargo test --all-features
       - name: Test (no default features)
         run: cargo test --no-default-features
+
+      - name: Install coverage tool
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Coverage (minimum 68% lines)
+        run: cargo llvm-cov --all-features --fail-under-lines 68

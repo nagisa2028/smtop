@@ -169,71 +169,120 @@ fn run_loop(terminal: &mut DefaultTerminal, state: &SharedState) -> io::Result<(
         if event::poll(Duration::from_millis(FRAME_MS))? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    redraw = true;
-                    let in_procs = view.tab == Tab::Processes;
-                    let in_gpu = view.tab == Tab::Gpu;
-                    match key.code {
-                        KeyCode::Char('q') => return Ok(()),
-                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            return Ok(());
-                        }
-                        // Esc backs out one level: from any tab to Overview, and
-                        // from Overview it quits.
-                        KeyCode::Esc => {
-                            if view.tab == Tab::Overview {
-                                return Ok(());
-                            }
-                            switch_tab(&mut view, Tab::Overview);
-                        }
-                        KeyCode::Char(' ') => view.paused = !view.paused,
-                        KeyCode::Tab => {
-                            let t = view.tab.next();
-                            switch_tab(&mut view, t);
-                        }
-                        KeyCode::BackTab => {
-                            let t = view.tab.prev();
-                            switch_tab(&mut view, t);
-                        }
-                        KeyCode::Char(c @ '1'..='9') => {
-                            if let Some(tab) = Tab::from_number(c as usize - '1' as usize) {
-                                switch_tab(&mut view, tab);
-                            }
-                        }
-                        KeyCode::Char('s') if in_procs => {
-                            view.proc_sort = view.proc_sort.next();
-                            view.proc_rev = false;
-                        }
-                        KeyCode::Char('r') if in_procs => view.proc_rev = !view.proc_rev,
-                        KeyCode::Char('c') if in_procs => set_sort(&mut view, ProcSort::Cpu),
-                        KeyCode::Char('m') if in_procs => set_sort(&mut view, ProcSort::Mem),
-                        KeyCode::Char('d') if in_procs => set_sort(&mut view, ProcSort::DiskRead),
-                        KeyCode::Char('D') if in_procs => set_sort(&mut view, ProcSort::DiskWrite),
-                        KeyCode::Char('g') if in_procs => set_sort(&mut view, ProcSort::GpuPct),
-                        KeyCode::Char('G') if in_procs => set_sort(&mut view, ProcSort::GpuVram),
-                        KeyCode::Char('p') if in_procs => set_sort(&mut view, ProcSort::Pid),
-                        KeyCode::Down | KeyCode::Char('j') if in_procs => {
-                            // Clamp so overshooting the end doesn't accumulate
-                            // presses that ↑ would have to undo one by one.
-                            let count = state.procs.load_full().map_or(0, |p| p.len());
-                            view.proc_scroll = (view.proc_scroll + 1).min(count.saturating_sub(1));
-                        }
-                        KeyCode::Up | KeyCode::Char('k') if in_procs => {
-                            view.proc_scroll = view.proc_scroll.saturating_sub(1);
-                        }
-                        KeyCode::Down | KeyCode::Char('j') if in_gpu => {
-                            let count = gpu_count(state);
-                            view.gpu_sel = (view.gpu_sel + 1).min(count.saturating_sub(1));
-                        }
-                        KeyCode::Up | KeyCode::Char('k') if in_gpu => {
-                            view.gpu_sel = view.gpu_sel.saturating_sub(1);
-                        }
-                        _ => redraw = false,
+                    match handle_key(&mut view, key.code, key.modifiers, state) {
+                        KeyOutcome::Quit => return Ok(()),
+                        KeyOutcome::Redraw => redraw = true,
+                        KeyOutcome::Ignored => redraw = false,
                     }
                 }
                 Event::Resize(_, _) => redraw = true,
                 _ => {}
             }
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeyOutcome {
+    Quit,
+    Redraw,
+    Ignored,
+}
+
+fn handle_key(
+    view: &mut View,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    state: &SharedState,
+) -> KeyOutcome {
+    let in_procs = view.tab == Tab::Processes;
+    let in_gpu = view.tab == Tab::Gpu;
+    match code {
+        KeyCode::Char('q') => KeyOutcome::Quit,
+        KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => KeyOutcome::Quit,
+        KeyCode::Esc => {
+            if view.tab == Tab::Overview {
+                KeyOutcome::Quit
+            } else {
+                switch_tab(view, Tab::Overview);
+                KeyOutcome::Redraw
+            }
+        }
+        KeyCode::Char(' ') => {
+            view.paused = !view.paused;
+            KeyOutcome::Redraw
+        }
+        KeyCode::Tab => {
+            switch_tab(view, view.tab.next());
+            KeyOutcome::Redraw
+        }
+        KeyCode::BackTab => {
+            switch_tab(view, view.tab.prev());
+            KeyOutcome::Redraw
+        }
+        KeyCode::Char(c @ '1'..='9') => match Tab::from_number(c as usize - '1' as usize) {
+            Some(tab) => {
+                switch_tab(view, tab);
+                KeyOutcome::Redraw
+            }
+            None => KeyOutcome::Ignored,
+        },
+        KeyCode::Char('s') if in_procs => {
+            view.proc_sort = view.proc_sort.next();
+            view.proc_rev = false;
+            KeyOutcome::Redraw
+        }
+        KeyCode::Char('r') if in_procs => {
+            view.proc_rev = !view.proc_rev;
+            KeyOutcome::Redraw
+        }
+        KeyCode::Char('c') if in_procs => {
+            set_sort(view, ProcSort::Cpu);
+            KeyOutcome::Redraw
+        }
+        KeyCode::Char('m') if in_procs => {
+            set_sort(view, ProcSort::Mem);
+            KeyOutcome::Redraw
+        }
+        KeyCode::Char('d') if in_procs => {
+            set_sort(view, ProcSort::DiskRead);
+            KeyOutcome::Redraw
+        }
+        KeyCode::Char('D') if in_procs => {
+            set_sort(view, ProcSort::DiskWrite);
+            KeyOutcome::Redraw
+        }
+        KeyCode::Char('g') if in_procs => {
+            set_sort(view, ProcSort::GpuPct);
+            KeyOutcome::Redraw
+        }
+        KeyCode::Char('G') if in_procs => {
+            set_sort(view, ProcSort::GpuVram);
+            KeyOutcome::Redraw
+        }
+        KeyCode::Char('p') if in_procs => {
+            set_sort(view, ProcSort::Pid);
+            KeyOutcome::Redraw
+        }
+        KeyCode::Down | KeyCode::Char('j') if in_procs => {
+            let count = state.procs.load_full().map_or(0, |p| p.len());
+            view.proc_scroll = (view.proc_scroll + 1).min(count.saturating_sub(1));
+            KeyOutcome::Redraw
+        }
+        KeyCode::Up | KeyCode::Char('k') if in_procs => {
+            view.proc_scroll = view.proc_scroll.saturating_sub(1);
+            KeyOutcome::Redraw
+        }
+        KeyCode::Down | KeyCode::Char('j') if in_gpu => {
+            let count = gpu_count(state);
+            view.gpu_sel = (view.gpu_sel + 1).min(count.saturating_sub(1));
+            KeyOutcome::Redraw
+        }
+        KeyCode::Up | KeyCode::Char('k') if in_gpu => {
+            view.gpu_sel = view.gpu_sel.saturating_sub(1);
+            KeyOutcome::Redraw
+        }
+        _ => KeyOutcome::Ignored,
     }
 }
 
@@ -665,18 +714,48 @@ fn clean_truncate(s: &str, max: usize) -> String {
     truncate(&clean_text(s), max)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Freshness {
+    Fresh,
+    Stale,
+    Never,
+}
+
+fn freshness(
+    at: Option<std::time::Instant>,
+    now: std::time::Instant,
+    max_age: Duration,
+) -> Freshness {
+    match at {
+        Some(at) if now.saturating_duration_since(at) <= max_age => Freshness::Fresh,
+        Some(_) => Freshness::Stale,
+        None => Freshness::Never,
+    }
+}
+
 /// Top header: identity, clock, tab bar, per-collector liveness, key hints.
 fn render_header(frame: &mut Frame, area: Rect, state: &SharedState, view: &View) {
     let now = chrono::Local::now().format("%H:%M:%S");
     let mut spans = vec![
         Span::styled("smtop", Style::new().fg(Color::Cyan).bold()),
         Span::raw(" "),
+    ];
+    // Keep the pause indicator near the left edge so it remains visible even
+    // when narrow terminals clip tabs, liveness labels and key hints.
+    if view.paused {
+        spans.push(Span::styled(
+            " PAUSED ",
+            Style::new().fg(Color::Black).bg(Color::Yellow),
+        ));
+        spans.push(Span::raw(" "));
+    }
+    spans.extend([
         Span::styled(hostname(), Style::new().fg(Color::White)),
         Span::styled(
             format!("  {now}  "),
             Style::new().add_modifier(Modifier::DIM),
         ),
-    ];
+    ]);
     // Tab bar: selected tab reversed, others dim.
     for (i, tab) in Tab::ALL.iter().enumerate() {
         let style = if view.tab == *tab {
@@ -691,6 +770,7 @@ fn render_header(frame: &mut Frame, area: Rect, state: &SharedState, view: &View
     // but stale (the collector stopped updating — e.g. a driver died — so the
     // data on screen is frozen), red = never published.
     let base = crate::collector::sample_interval();
+    let freshness_now = std::time::Instant::now();
     let gpu_at = [state.nvidia.load_full(), state.amd.load_full()]
         .into_iter()
         .flatten()
@@ -705,18 +785,12 @@ fn render_header(frame: &mut Frame, area: Rect, state: &SharedState, view: &View
         // fs samples every 5 intervals, so its stale threshold scales too.
         ("fs", state.fs.load_full().map(|s| s.at), 15),
     ] {
-        let color = match at {
-            Some(t) if t.elapsed() <= base * mult => Color::Green,
-            Some(_) => Color::Yellow,
-            None => Color::Red,
+        let color = match freshness(at, freshness_now, base * mult) {
+            Freshness::Fresh => Color::Green,
+            Freshness::Stale => Color::Yellow,
+            Freshness::Never => Color::Red,
         };
         spans.push(Span::styled(format!("{label} "), Style::new().fg(color)));
-    }
-    if view.paused {
-        spans.push(Span::styled(
-            " PAUSED ",
-            Style::new().fg(Color::Black).bg(Color::Yellow),
-        ));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
     let hints = match view.tab {
@@ -1388,11 +1462,14 @@ fn pct(used: u64, total: u64) -> f32 {
     if total == 0 {
         0.0
     } else {
-        (100.0 * used as f64 / total as f64) as f32
+        (100.0 * used as f64 / total as f64).min(100.0) as f32
     }
 }
 
 fn truncate(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
     if s.chars().count() <= max {
         s.to_string()
     } else {
@@ -1447,9 +1524,113 @@ mod tests {
     }
 
     #[test]
+    fn key_handler_covers_pause_navigation_scroll_and_quit() {
+        let state = SharedState::default();
+        state
+            .procs
+            .store(Some(std::sync::Arc::new(Stamped::new(vec![
+                ProcInfo {
+                    pid: 1,
+                    name: "one".into(),
+                    cpu_pct: 0.0,
+                    rss: 0,
+                    state: 'S',
+                    disk_read_bps: 0.0,
+                    disk_write_bps: 0.0,
+                    io_ok: false,
+                },
+                ProcInfo {
+                    pid: 2,
+                    name: "two".into(),
+                    cpu_pct: 0.0,
+                    rss: 0,
+                    state: 'S',
+                    disk_read_bps: 0.0,
+                    disk_write_bps: 0.0,
+                    io_ok: false,
+                },
+            ]))));
+        let mut view = View::default();
+        assert_eq!(
+            handle_key(&mut view, KeyCode::Char(' '), KeyModifiers::NONE, &state),
+            KeyOutcome::Redraw
+        );
+        assert!(view.paused);
+        assert_eq!(
+            handle_key(&mut view, KeyCode::Tab, KeyModifiers::NONE, &state),
+            KeyOutcome::Redraw
+        );
+        assert_eq!(view.tab, Tab::Processes);
+        for _ in 0..3 {
+            handle_key(&mut view, KeyCode::Down, KeyModifiers::NONE, &state);
+        }
+        assert_eq!(view.proc_scroll, 1);
+        handle_key(&mut view, KeyCode::Up, KeyModifiers::NONE, &state);
+        assert_eq!(view.proc_scroll, 0);
+        assert_eq!(
+            handle_key(&mut view, KeyCode::Char('x'), KeyModifiers::NONE, &state),
+            KeyOutcome::Ignored
+        );
+        assert_eq!(
+            handle_key(&mut view, KeyCode::Esc, KeyModifiers::NONE, &state),
+            KeyOutcome::Redraw
+        );
+        assert_eq!(view.tab, Tab::Overview);
+        assert_eq!(
+            handle_key(&mut view, KeyCode::Esc, KeyModifiers::NONE, &state),
+            KeyOutcome::Quit
+        );
+        assert_eq!(
+            handle_key(&mut view, KeyCode::Char('c'), KeyModifiers::CONTROL, &state),
+            KeyOutcome::Quit
+        );
+
+        state.amd.store(Some(std::sync::Arc::new(Stamped::new(vec![
+            gpu_snap(GpuVendor::Amd, 0, "A0"),
+            gpu_snap(GpuVendor::Amd, 1, "A1"),
+        ]))));
+        view.tab = Tab::Gpu;
+        for _ in 0..3 {
+            handle_key(&mut view, KeyCode::Down, KeyModifiers::NONE, &state);
+        }
+        assert_eq!(view.gpu_sel, 1);
+        handle_key(&mut view, KeyCode::Up, KeyModifiers::NONE, &state);
+        assert_eq!(view.gpu_sel, 0);
+    }
+
+    #[test]
+    fn freshness_threshold_is_inclusive() {
+        let now = std::time::Instant::now();
+        let age = Duration::from_secs(3);
+        assert_eq!(freshness(None, now, age), Freshness::Never);
+        assert_eq!(freshness(Some(now - age), now, age), Freshness::Fresh);
+        assert_eq!(
+            freshness(Some(now - age - Duration::from_nanos(1)), now, age),
+            Freshness::Stale
+        );
+    }
+
+    #[test]
     fn clean_text_strips_terminal_controls() {
         assert_eq!(clean_text("ok\u{1b}]0;bad\u{7}\nname\0"), "ok]0;badname");
         assert_eq!(clean_truncate("abcdef", 4), "…def");
+    }
+
+    #[test]
+    fn percentage_truncation_and_small_terminal_boundaries() {
+        assert_eq!(pct(1, 0), 0.0);
+        assert_eq!(pct(50, 100), 50.0);
+        assert_eq!(pct(150, 100), 100.0);
+        assert_eq!(truncate("abcdef", 0), "");
+        assert_eq!(truncate("abcdef", 1), "…");
+        assert_eq!(truncate("あいうえ", 3), "…うえ");
+
+        let state = SharedState::default();
+        let view = View::default();
+        let text = full_to_text(&state, &view, 40, 10);
+        assert!(text.contains("terminal too small"));
+        // The documented minimum must render without layout underflow.
+        let _ = full_to_text(&state, &view, 50, 18);
     }
 
     #[test]
@@ -1556,6 +1737,33 @@ mod tests {
             pos(&t, "BBB_high_mem") < pos(&t, "AAA_high_cpu"),
             "VRAM sort order wrong"
         );
+    }
+
+    #[test]
+    fn processes_tab_applies_scroll_offset() {
+        let state = SharedState::default();
+        state.procs.store(Some(std::sync::Arc::new(Stamped::new(
+            (0..30)
+                .map(|pid| ProcInfo {
+                    pid,
+                    name: format!("item_{pid:02}"),
+                    cpu_pct: 30.0 - pid as f32,
+                    rss: 0,
+                    state: 'S',
+                    disk_read_bps: 0.0,
+                    disk_write_bps: 0.0,
+                    io_ok: true,
+                })
+                .collect(),
+        ))));
+        let view = View {
+            tab: Tab::Processes,
+            proc_scroll: 10,
+            ..View::default()
+        };
+        let text = full_to_text(&state, &view, 90, 18);
+        assert!(!text.contains("item_00"));
+        assert!(text.contains("item_10"));
     }
 
     fn synth(core_groups: Vec<CoreGroup>, ncpu: usize) -> CpuSnapshot {
@@ -1745,5 +1953,58 @@ mod tests {
         let text = full_to_text(&state, &view, 90, 24);
         assert!(text.contains("RTX_TEST"), "nvidia band missing:\n{text}");
         assert!(text.contains("RADEON_TEST"), "amd band missing:\n{text}");
+    }
+
+    #[test]
+    fn responsive_breakpoints_many_gpus_pause_and_permission_cells_render() {
+        let state = SharedState::default();
+        state.amd.store(Some(std::sync::Arc::new(Stamped::new(
+            (0..5)
+                .map(|i| gpu_snap(GpuVendor::Amd, i, &format!("GPU_{i}")))
+                .collect(),
+        ))));
+        state
+            .procs
+            .store(Some(std::sync::Arc::new(Stamped::new(vec![ProcInfo {
+                pid: 7,
+                name: "permission_test".into(),
+                cpu_pct: 0.0,
+                rss: 0,
+                state: 'S',
+                disk_read_bps: 0.0,
+                disk_write_bps: 0.0,
+                io_ok: false,
+            }]))));
+
+        let paused = View {
+            paused: true,
+            ..View::default()
+        };
+        for (width, height) in [(50, 18), (83, 26), (84, 30), (120, 36)] {
+            let text = full_to_text(&state, &paused, width, height);
+            assert!(text.contains("PAUSED"));
+        }
+
+        let processes = View {
+            tab: Tab::Processes,
+            ..View::default()
+        };
+        assert!(full_to_text(&state, &processes, 90, 18).contains("n/a"));
+
+        let mut suspended = gpu_snap(GpuVendor::Amd, 0, "SUSPENDED");
+        suspended.suspended = true;
+        suspended.temp_c = None;
+        suspended.power_w = None;
+        assert!(
+            gpu_telemetry_line(&suspended)
+                .to_string()
+                .contains("suspended")
+        );
+        suspended.note = Some("unsupported table".into());
+        assert!(
+            gpu_telemetry_line(&suspended)
+                .to_string()
+                .contains("unsupported")
+        );
     }
 }
