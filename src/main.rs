@@ -2,6 +2,7 @@ mod collector;
 mod model;
 mod ui;
 
+use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -11,28 +12,72 @@ use ui::fmt_bytes;
 
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    // `--log <file>`: record collector errors for diagnosing odd hardware.
-    if let Some(i) = args.iter().position(|a| a == "--log") {
-        match args.get(i + 1).filter(|p| !p.starts_with("--")) {
-            Some(path) => {
-                if let Err(e) = collector::init_logger(path) {
-                    eprintln!("smtop: cannot open log {path}: {e}");
-                }
-            }
-            None => eprintln!("smtop: --log expects a file path"),
-        }
+    let parsed = parse_args(&args);
+    for error in &parsed.errors {
+        eprintln!("smtop: {error}");
     }
-    // `--interval <ms>`: base sampling interval (default 1000).
-    if let Some(i) = args.iter().position(|a| a == "--interval") {
-        match args.get(i + 1).and_then(|v| v.parse::<u64>().ok()) {
-            Some(ms) => collector::set_interval_ms(ms),
-            None => eprintln!("smtop: --interval expects milliseconds"),
-        }
+    if let Some(path) = &parsed.log
+        && let Err(e) = collector::init_logger(path)
+    {
+        eprintln!("smtop: cannot open log {path}: {e}");
+    }
+    if let Some(ms) = parsed.interval_ms {
+        collector::set_interval_ms(ms);
     }
 
     let state = Arc::new(SharedState::default());
     let shutdown = Arc::new(AtomicBool::new(false));
 
+    spawn_collectors(&state, &shutdown);
+
+    if parsed.probe {
+        std::thread::sleep(
+            collector::sample_interval() * 2 + std::time::Duration::from_millis(500),
+        );
+        print_probe(&state);
+        shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+        return Ok(());
+    }
+
+    ui::run(state, shutdown)
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ParsedArgs {
+    log: Option<String>,
+    interval_ms: Option<u64>,
+    probe: bool,
+    errors: Vec<String>,
+}
+
+fn parse_args(args: &[String]) -> ParsedArgs {
+    let mut parsed = ParsedArgs::default();
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--log" => match args.get(i + 1).filter(|p| !p.starts_with("--")) {
+                Some(path) => {
+                    parsed.log = Some(path.clone());
+                    i += 1;
+                }
+                None => parsed.errors.push("--log expects a file path".into()),
+            },
+            "--interval" => match args.get(i + 1).and_then(|v| v.parse::<u64>().ok()) {
+                Some(ms) => {
+                    parsed.interval_ms = Some(ms);
+                    i += 1;
+                }
+                None => parsed.errors.push("--interval expects milliseconds".into()),
+            },
+            "--probe" => parsed.probe = true,
+            _ => {}
+        }
+        i += 1;
+    }
+    parsed
+}
+
+fn spawn_collectors(state: &Arc<SharedState>, shutdown: &Arc<AtomicBool>) {
     {
         let s = state.clone();
         spawn(
@@ -98,19 +143,6 @@ fn main() -> std::io::Result<()> {
             move |o| s.gpu_procs.store(Some(Arc::new(Stamped::new(o)))),
         );
     }
-
-    // Headless probe: dump one sample and exit (useful over SSH, no TTY needed).
-    // Wait two intervals so rate collectors have a delta to report.
-    if std::env::args().any(|a| a == "--probe") {
-        std::thread::sleep(
-            collector::sample_interval() * 2 + std::time::Duration::from_millis(500),
-        );
-        print_probe(&state);
-        shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
-        return Ok(());
-    }
-
-    ui::run(state, shutdown)
 }
 
 /// Strip control characters from externally sourced names (process cmdlines,
@@ -121,8 +153,20 @@ fn clean(s: &str) -> String {
 }
 
 fn print_probe(state: &SharedState) {
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    let _ = write_probe(state, &mut out);
+}
+
+fn write_probe<W: Write>(state: &SharedState, out: &mut W) -> std::io::Result<()> {
+    macro_rules! probe_line {
+        ($($arg:tt)*) => {
+            writeln!(out, $($arg)*)?
+        };
+    }
+
     if let Some(c) = state.cpu.load_full() {
-        println!(
+        probe_line!(
             "CPU  {}  usage={:.0}%  {}  {}  mem={}/{} MB  load {:.2}",
             clean(&c.model),
             c.usage,
@@ -140,7 +184,7 @@ fn print_probe(state: &SharedState) {
     for (label, slot) in [("NVIDIA", &state.nvidia), ("AMD", &state.amd)] {
         if let Some(gpus) = slot.load_full() {
             for g in gpus.iter() {
-                println!(
+                probe_line!(
                     "{label}[{}] {}{}  busy={:.0}%  vram={}/{} MB  temp={}  power={}  sclk={}  fan={}",
                     g.index,
                     clean(&g.name),
@@ -172,7 +216,7 @@ fn print_probe(state: &SharedState) {
     }
     if let Some(net) = state.net.load_full() {
         for n in net.iter().take(3) {
-            println!(
+            probe_line!(
                 "NET  {}  rx={:.0} tx={:.0} B/s  link={}",
                 clean(&n.iface),
                 n.rx_bps,
@@ -187,7 +231,7 @@ fn print_probe(state: &SharedState) {
     }
     if let Some(disk) = state.disk.load_full() {
         for d in disk.iter() {
-            println!(
+            probe_line!(
                 "DISK {}  r={:.0} w={:.0} B/s  util={:.0}%  iops r{:.0}/w{:.0}",
                 clean(&d.dev),
                 d.r_bps,
@@ -200,7 +244,7 @@ fn print_probe(state: &SharedState) {
     }
     if let Some(fs) = state.fs.load_full() {
         for f in fs.iter().take(6) {
-            println!(
+            probe_line!(
                 "FS   {}  {}/{}",
                 clean(&f.mount),
                 fmt_bytes(f.used),
@@ -211,9 +255,9 @@ fn print_probe(state: &SharedState) {
     if let Some(gp) = state.gpu_procs.load_full() {
         let mut v: Vec<_> = gp.iter().collect();
         v.sort_by_key(|(_, g)| std::cmp::Reverse(g.vram));
-        println!("GPU-PROCS {} using GPU; top by VRAM:", gp.len());
+        probe_line!("GPU-PROCS {} using GPU; top by VRAM:", gp.len());
         for (pid, g) in v.iter().take(5) {
-            println!(
+            probe_line!(
                 "  {:>7} [{}] {:.0}% util  {} MB VRAM",
                 pid,
                 clean(&g.label),
@@ -225,7 +269,7 @@ fn print_probe(state: &SharedState) {
     if let Some(procs) = state.procs.load_full() {
         let mut top = procs.to_vec();
         top.sort_by(|a, b| b.cpu_pct.total_cmp(&a.cpu_pct));
-        println!("PROCS {} total; top by CPU:", procs.len());
+        probe_line!("PROCS {} total; top by CPU:", procs.len());
         for p in top.iter().take(5) {
             let disk = if p.io_ok {
                 format!(
@@ -236,7 +280,7 @@ fn print_probe(state: &SharedState) {
             } else {
                 "n/a (perm)".into()
             };
-            println!(
+            probe_line!(
                 "  {:>7} {:>5.1}% {:>8} MB  disk {disk}  {} {}",
                 p.pid,
                 p.cpu_pct,
@@ -245,5 +289,82 @@ fn print_probe(state: &SharedState) {
                 clean(&p.name).chars().take(36).collect::<String>()
             );
         }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use model::{FsSnapshot, ProcInfo};
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn cli_parser_handles_valid_and_missing_values() {
+        assert_eq!(
+            parse_args(&args(&[
+                "smtop",
+                "--log",
+                "out.log",
+                "--interval",
+                "250",
+                "--probe"
+            ])),
+            ParsedArgs {
+                log: Some("out.log".into()),
+                interval_ms: Some(250),
+                probe: true,
+                errors: vec![],
+            }
+        );
+
+        let invalid = parse_args(&args(&["smtop", "--log", "--interval", "bad", "--probe"]));
+        assert!(invalid.log.is_none());
+        assert!(invalid.interval_ms.is_none());
+        assert!(invalid.probe);
+        assert_eq!(invalid.errors.len(), 2);
+    }
+
+    #[test]
+    fn probe_output_is_sanitized_sorted_and_reports_permissions() {
+        let state = SharedState::default();
+        state.fs.store(Some(Arc::new(Stamped::new(vec![FsSnapshot {
+            mount: "/safe\u{1b}[31m\nmount".into(),
+            used: 1,
+            total: 2,
+        }]))));
+        state.procs.store(Some(Arc::new(Stamped::new(vec![
+            ProcInfo {
+                pid: 1,
+                name: "low".into(),
+                cpu_pct: 1.0,
+                rss: 0,
+                state: 'S',
+                disk_read_bps: 0.0,
+                disk_write_bps: 0.0,
+                io_ok: true,
+            },
+            ProcInfo {
+                pid: 2,
+                name: "high\u{7}".into(),
+                cpu_pct: 90.0,
+                rss: 0,
+                state: 'R',
+                disk_read_bps: 0.0,
+                disk_write_bps: 0.0,
+                io_ok: false,
+            },
+        ]))));
+
+        let mut bytes = Vec::new();
+        write_probe(&state, &mut bytes).unwrap();
+        let output = String::from_utf8(bytes).unwrap();
+        assert!(!output.contains('\u{1b}'));
+        assert!(!output.contains('\u{7}'));
+        assert!(output.contains("n/a (perm)"));
+        assert!(output.find("high").unwrap() < output.find("low").unwrap());
     }
 }

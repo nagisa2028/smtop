@@ -272,7 +272,7 @@ pub struct ProcInfo {
 }
 
 /// Per-process GPU usage, aggregated across the GPUs a process touches.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct GpuProcUse {
     /// VRAM used by the process (bytes).
     pub vram: u64,

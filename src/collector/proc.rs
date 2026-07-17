@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use super::Collector;
@@ -84,21 +85,15 @@ impl Collector for ProcessCollector {
                 },
             );
 
-            // CPU% normalized so one fully-busy core reads ~100%.
-            let cpu_pct = match prev {
-                Some(p) if total_delta > 0 => {
-                    let dj = jiffies.saturating_sub(p.jiffies);
-                    (dj as f64 / total_delta as f64 * self.ncpu * 100.0) as f32
-                }
-                _ => 0.0,
-            };
-            let (disk_read_bps, disk_write_bps) = match (prev, dt) {
-                (Some(p), Some(dt)) if dt > 0.0 => (
-                    read_bytes.saturating_sub(p.read_bytes) as f64 / dt,
-                    write_bytes.saturating_sub(p.write_bytes) as f64 / dt,
-                ),
-                _ => (0.0, 0.0),
-            };
+            let (cpu_pct, disk_read_bps, disk_write_bps) = process_rates(
+                prev,
+                jiffies,
+                read_bytes,
+                write_bytes,
+                total_delta,
+                self.ncpu,
+                dt,
+            );
 
             let name = read_cmdline(pid).unwrap_or(comm);
             out.push(ProcInfo {
@@ -113,11 +108,45 @@ impl Collector for ProcessCollector {
             });
         }
 
-        self.prev = cur;
+        replace_previous(&mut self.prev, cur);
         self.prev_total = total;
         self.last = Some(now);
         Ok(out)
     }
+}
+
+fn replace_previous(previous: &mut HashMap<(i32, u64), Prev>, current: HashMap<(i32, u64), Prev>) {
+    *previous = current;
+}
+
+/// Calculate rates for one process observation. Keeping this independent of
+/// procfs makes first samples, PID reuse and counter resets deterministic to
+/// test (PID reuse is represented by `prev == None`).
+fn process_rates(
+    prev: Option<Prev>,
+    jiffies: u64,
+    read_bytes: u64,
+    write_bytes: u64,
+    total_delta: u64,
+    ncpu: f64,
+    dt: Option<f64>,
+) -> (f32, f64, f64) {
+    // CPU% normalized so one fully-busy core reads ~100%.
+    let cpu_pct = match prev {
+        Some(p) if total_delta > 0 => {
+            let dj = jiffies.saturating_sub(p.jiffies);
+            (dj as f64 / total_delta as f64 * ncpu * 100.0) as f32
+        }
+        _ => 0.0,
+    };
+    let (disk_read_bps, disk_write_bps) = match (prev, dt) {
+        (Some(p), Some(dt)) if dt > 0.0 => (
+            read_bytes.saturating_sub(p.read_bytes) as f64 / dt,
+            write_bytes.saturating_sub(p.write_bytes) as f64 / dt,
+        ),
+        _ => (0.0, 0.0),
+    };
+    (cpu_pct, disk_read_bps, disk_write_bps)
 }
 
 /// Disk bytes read/written from `/proc/<pid>/io` (read_bytes, write_bytes).
@@ -169,24 +198,33 @@ fn read_total_jiffies() -> u64 {
 /// fields. `starttime` (boot-relative ticks) identifies this incarnation of
 /// the PID.
 fn read_proc_stat(pid: i32) -> Option<(String, char, u64, u64)> {
-    let s = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    read_proc_stat_at(Path::new("/proc"), pid)
+}
+
+fn read_proc_stat_at(root: &Path, pid: i32) -> Option<(String, char, u64, u64)> {
+    let s = fs::read_to_string(root.join(pid.to_string()).join("stat")).ok()?;
+    parse_proc_stat(&s)
+}
+
+fn parse_proc_stat(s: &str) -> Option<(String, char, u64, u64)> {
     let open = s.find('(')?;
     let close = s.rfind(')')?;
     let comm = s.get(open + 1..close)?.to_string();
     let rest = s.get(close + 1..)?;
-    let f: Vec<&str> = rest.split_whitespace().collect();
+    let mut f = rest.split_whitespace();
     // After ')': index 0 = state (field 3) … 11 = utime (14), 12 = stime (15),
     // 19 = starttime (22).
-    let state = f.first().and_then(|s| s.chars().next()).unwrap_or('?');
-    let utime: u64 = f.get(11).and_then(|v| v.parse().ok()).unwrap_or(0);
-    let stime: u64 = f.get(12).and_then(|v| v.parse().ok()).unwrap_or(0);
-    let starttime: u64 = f.get(19).and_then(|v| v.parse().ok()).unwrap_or(0);
+    let state = f.next().and_then(|s| s.chars().next()).unwrap_or('?');
+    let utime: u64 = f.nth(10).and_then(|v| v.parse().ok()).unwrap_or(0);
+    let stime: u64 = f.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let starttime: u64 = f.nth(6).and_then(|v| v.parse().ok()).unwrap_or(0);
     Some((comm, state, utime + stime, starttime))
 }
 
-/// `starttime` alone, for callers that track per-pid deltas without the rest.
-pub(super) fn read_starttime(pid: i32) -> u64 {
-    read_proc_stat(pid).map(|(_, _, _, st)| st).unwrap_or(0)
+pub(super) fn read_starttime_at(root: &Path, pid: i32) -> u64 {
+    read_proc_stat_at(root, pid)
+        .map(|(_, _, _, st)| st)
+        .unwrap_or(0)
 }
 
 /// Resident set size in bytes from `/proc/<pid>/statm` (field 2 = pages).
@@ -213,4 +251,61 @@ fn read_cmdline(pid: i32) -> Option<String> {
         .trim()
         .to_string();
     (!s.is_empty()).then_some(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proc_stat_stream_parser_handles_spaces_and_parens() {
+        let stat = "42 (worker ) name) R 1 2 3 4 5 6 7 8 9 10 101 202 13 14 15 16 17 18 999";
+        let (name, state, jiffies, starttime) = parse_proc_stat(stat).unwrap();
+        assert_eq!(name, "worker ) name");
+        assert_eq!(state, 'R');
+        assert_eq!(jiffies, 303);
+        assert_eq!(starttime, 999);
+    }
+
+    #[test]
+    fn process_rates_cover_first_sample_delta_and_counter_reset() {
+        assert_eq!(
+            process_rates(None, 50, 1_000, 2_000, 100, 4.0, Some(1.0)),
+            (0.0, 0.0, 0.0)
+        );
+
+        let prev = Prev {
+            jiffies: 50,
+            read_bytes: 1_000,
+            write_bytes: 2_000,
+        };
+        let (cpu, read, write) = process_rates(Some(prev), 75, 3_000, 5_000, 100, 4.0, Some(2.0));
+        assert!((cpu - 100.0).abs() < f32::EPSILON);
+        assert_eq!(read, 1_000.0);
+        assert_eq!(write, 1_500.0);
+
+        // Kernel counters can reset; saturating subtraction must not spike.
+        assert_eq!(
+            process_rates(Some(prev), 10, 100, 200, 100, 4.0, Some(1.0)),
+            (0.0, 0.0, 0.0)
+        );
+        // A recycled PID has a different starttime and therefore no baseline.
+        assert_eq!(
+            process_rates(None, 10_000, 10_000, 10_000, 100, 4.0, Some(1.0)),
+            (0.0, 0.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn disappeared_and_recycled_pids_drop_old_baselines() {
+        let mut previous =
+            HashMap::from([((10, 100), Prev::default()), ((20, 200), Prev::default())]);
+        replace_previous(
+            &mut previous,
+            HashMap::from([((20, 200), Prev::default()), ((10, 999), Prev::default())]),
+        );
+        assert!(!previous.contains_key(&(10, 100)));
+        assert!(previous.contains_key(&(10, 999)));
+        assert!(previous.contains_key(&(20, 200)));
+    }
 }

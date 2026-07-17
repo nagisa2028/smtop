@@ -1,6 +1,6 @@
 //! Disk I/O collector from `/proc/diskstats` (physical devices only).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::time::{Duration, Instant};
 
@@ -16,6 +16,7 @@ struct Prev {
     reads_done: u64,
     writes_done: u64,
     io_ticks: u64,
+    initialized: bool,
     r_hist: History,
     w_hist: History,
 }
@@ -31,6 +32,10 @@ impl DiskCollector {
             prev: HashMap::new(),
             last: None,
         }
+    }
+
+    fn retain_seen(&mut self, seen: &HashSet<String>) {
+        self.prev.retain(|dev, _| seen.contains(dev));
     }
 }
 
@@ -52,6 +57,7 @@ impl Collector for DiskCollector {
         self.last = Some(now);
 
         let mut out = Vec::new();
+        let mut seen = HashSet::new();
         for line in content.lines() {
             let Some(st) = parse_diskstat_line(line) else {
                 continue;
@@ -59,6 +65,7 @@ impl Collector for DiskCollector {
             if !is_physical(&st.name) {
                 continue;
             }
+            seen.insert(st.name.clone());
             let (name, reads_done, read_sectors, writes_done, write_sectors, io_ticks) = (
                 st.name.as_str(),
                 st.reads,
@@ -69,25 +76,23 @@ impl Collector for DiskCollector {
             );
 
             let prev = self.prev.entry(name.to_string()).or_default();
-            let (r_bps, w_bps, util_pct, r_iops, w_iops) = match dt {
-                Some(dt) if dt > 0.0 => (
-                    read_sectors.saturating_sub(prev.read_sectors) as f64 * SECTOR_BYTES as f64
-                        / dt,
-                    write_sectors.saturating_sub(prev.write_sectors) as f64 * SECTOR_BYTES as f64
-                        / dt,
-                    (io_ticks.saturating_sub(prev.io_ticks) as f64 / (dt * 1000.0) * 100.0)
-                        .min(100.0) as f32,
-                    reads_done.saturating_sub(prev.reads_done) as f64 / dt,
-                    writes_done.saturating_sub(prev.writes_done) as f64 / dt,
-                ),
-                _ => (0.0, 0.0, 0.0, 0.0, 0.0),
-            };
+            let initialized = prev.initialized;
+            let (r_bps, w_bps, util_pct, r_iops, w_iops) = disk_rates(
+                prev,
+                reads_done,
+                read_sectors,
+                writes_done,
+                write_sectors,
+                io_ticks,
+                dt,
+            );
             prev.read_sectors = read_sectors;
             prev.write_sectors = write_sectors;
             prev.reads_done = reads_done;
             prev.writes_done = writes_done;
             prev.io_ticks = io_ticks;
-            if dt.is_some() {
+            prev.initialized = true;
+            if initialized && dt.is_some_and(|dt| dt > 0.0) {
                 prev.r_hist.push(r_bps);
                 prev.w_hist.push(w_bps);
             }
@@ -103,8 +108,31 @@ impl Collector for DiskCollector {
                 w_iops,
             });
         }
+        self.retain_seen(&seen);
         out.sort_by(|a, b| a.dev.cmp(&b.dev));
         Ok(out)
+    }
+}
+
+fn disk_rates(
+    prev: &Prev,
+    reads_done: u64,
+    read_sectors: u64,
+    writes_done: u64,
+    write_sectors: u64,
+    io_ticks: u64,
+    dt: Option<f64>,
+) -> (f64, f64, f32, f64, f64) {
+    match dt {
+        Some(dt) if prev.initialized && dt > 0.0 => (
+            read_sectors.saturating_sub(prev.read_sectors) as f64 * SECTOR_BYTES as f64 / dt,
+            write_sectors.saturating_sub(prev.write_sectors) as f64 * SECTOR_BYTES as f64 / dt,
+            (io_ticks.saturating_sub(prev.io_ticks) as f64 / (dt * 1000.0) * 100.0).min(100.0)
+                as f32,
+            reads_done.saturating_sub(prev.reads_done) as f64 / dt,
+            writes_done.saturating_sub(prev.writes_done) as f64 / dt,
+        ),
+        _ => (0.0, 0.0, 0.0, 0.0, 0.0),
     }
 }
 
@@ -148,17 +176,20 @@ struct RawDiskStat {
 /// Fields (0-based): 2 name, 3 reads_completed, 5 sectors_read,
 /// 7 writes_completed, 9 sectors_written, 12 io_ticks (ms device busy).
 fn parse_diskstat_line(line: &str) -> Option<RawDiskStat> {
-    let f: Vec<&str> = line.split_whitespace().collect();
-    if f.len() < 10 {
-        return None;
-    }
+    let mut f = line.split_whitespace();
+    let name = f.nth(2)?.to_string();
+    let reads = f.next()?.parse().ok()?;
+    let read_sectors = f.nth(1)?.parse().ok()?;
+    let writes = f.nth(1)?.parse().ok()?;
+    let write_sectors = f.nth(1)?.parse().ok()?;
+    let io_ticks = f.nth(2).and_then(|v| v.parse().ok()).unwrap_or(0);
     Some(RawDiskStat {
-        name: f[2].to_string(),
-        reads: f[3].parse().ok()?,
-        read_sectors: f[5].parse().ok()?,
-        writes: f[7].parse().ok()?,
-        write_sectors: f[9].parse().ok()?,
-        io_ticks: f.get(12).and_then(|v| v.parse().ok()).unwrap_or(0),
+        name,
+        reads,
+        read_sectors,
+        writes,
+        write_sectors,
+        io_ticks,
     })
 }
 
@@ -196,5 +227,39 @@ mod tests {
         assert!(!is_physical("mmcblk0p1"));
         assert!(!is_physical("mmcblk0boot0"));
         assert!(!is_physical("mmcblk0rpmb"));
+    }
+
+    #[test]
+    fn disk_rates_cover_first_sample_reset_and_util_cap() {
+        let mut prev = Prev::default();
+        assert_eq!(
+            disk_rates(&prev, 10, 100, 20, 200, 500, Some(1.0)),
+            (0.0, 0.0, 0.0, 0.0, 0.0)
+        );
+
+        prev.reads_done = 10;
+        prev.read_sectors = 100;
+        prev.writes_done = 20;
+        prev.write_sectors = 200;
+        prev.io_ticks = 500;
+        prev.initialized = true;
+        assert_eq!(
+            disk_rates(&prev, 14, 104, 26, 208, 3_500, Some(2.0)),
+            (1_024.0, 2_048.0, 100.0, 2.0, 3.0)
+        );
+        assert_eq!(
+            disk_rates(&prev, 1, 1, 1, 1, 1, Some(1.0)),
+            (0.0, 0.0, 0.0, 0.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn disappeared_disks_drop_their_baselines() {
+        let mut collector = DiskCollector::new();
+        collector.prev.insert("sda".into(), Prev::default());
+        collector.prev.insert("sdb".into(), Prev::default());
+        collector.retain_seen(&HashSet::from(["sda".to_string()]));
+        assert!(collector.prev.contains_key("sda"));
+        assert!(!collector.prev.contains_key("sdb"));
     }
 }

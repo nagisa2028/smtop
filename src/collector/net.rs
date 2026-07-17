@@ -1,6 +1,6 @@
 //! Network throughput collector from `/proc/net/dev`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::time::{Duration, Instant};
 
@@ -11,6 +11,7 @@ use crate::model::{History, NetSnapshot};
 struct Prev {
     rx: u64,
     tx: u64,
+    initialized: bool,
     rx_hist: History,
     tx_hist: History,
 }
@@ -28,6 +29,10 @@ impl NetCollector {
             last: None,
             skip_loopback: false,
         }
+    }
+
+    fn retain_seen(&mut self, seen: &HashSet<String>) {
+        self.prev.retain(|iface, _| seen.contains(iface));
     }
 }
 
@@ -49,6 +54,7 @@ impl Collector for NetCollector {
         self.last = Some(now);
 
         let mut out = Vec::new();
+        let mut seen = HashSet::new();
         for line in content.lines().skip(2) {
             let Some((iface, rx, tx)) = parse_netdev_line(line) else {
                 continue;
@@ -56,18 +62,15 @@ impl Collector for NetCollector {
             if self.skip_loopback && iface == "lo" {
                 continue;
             }
+            seen.insert(iface.clone());
 
             let prev = self.prev.entry(iface.clone()).or_default();
-            let (rx_bps, tx_bps) = match dt {
-                Some(dt) if dt > 0.0 => (
-                    rx.saturating_sub(prev.rx) as f64 / dt,
-                    tx.saturating_sub(prev.tx) as f64 / dt,
-                ),
-                _ => (0.0, 0.0),
-            };
+            let initialized = prev.initialized;
+            let (rx_bps, tx_bps) = net_rates(prev, rx, tx, dt);
             prev.rx = rx;
             prev.tx = tx;
-            if dt.is_some() {
+            prev.initialized = true;
+            if initialized && dt.is_some_and(|dt| dt > 0.0) {
                 prev.rx_hist.push(rx_bps);
                 prev.tx_hist.push(tx_bps);
             }
@@ -92,6 +95,7 @@ impl Collector for NetCollector {
                 speed_mbps,
             });
         }
+        self.retain_seen(&seen);
         // Busiest interfaces first.
         out.sort_by(|a, b| {
             (b.rx_bps + b.tx_bps)
@@ -102,18 +106,24 @@ impl Collector for NetCollector {
     }
 }
 
+fn net_rates(prev: &Prev, rx: u64, tx: u64, dt: Option<f64>) -> (f64, f64) {
+    match dt {
+        Some(dt) if prev.initialized && dt > 0.0 => (
+            rx.saturating_sub(prev.rx) as f64 / dt,
+            tx.saturating_sub(prev.tx) as f64 / dt,
+        ),
+        _ => (0.0, 0.0),
+    }
+}
+
 /// Pure parse of a `/proc/net/dev` data line into `(iface, rx_bytes, tx_bytes)`.
 /// Per-iface columns after the colon: 0 rx_bytes … 8 tx_bytes.
 fn parse_netdev_line(line: &str) -> Option<(String, u64, u64)> {
     let (iface, rest) = line.split_once(':')?;
-    let cols: Vec<u64> = rest
-        .split_whitespace()
-        .map(|v| v.parse().unwrap_or(0))
-        .collect();
-    if cols.len() < 9 {
-        return None;
-    }
-    Some((iface.trim().to_string(), cols[0], cols[8]))
+    let mut cols = rest.split_whitespace();
+    let rx = cols.next()?.parse().unwrap_or(0);
+    let tx = cols.nth(7)?.parse().unwrap_or(0);
+    Some((iface.trim().to_string(), rx, tx))
 }
 
 #[cfg(test)]
@@ -134,5 +144,31 @@ mod tests {
     fn netdev_rejects_header_and_short() {
         assert!(parse_netdev_line("Inter-|   Receive").is_none());
         assert!(parse_netdev_line("lo: 1 2 3").is_none());
+    }
+
+    #[test]
+    fn net_rates_ignore_first_observation_and_counter_reset() {
+        let mut prev = Prev::default();
+        assert_eq!(net_rates(&prev, 10_000, 20_000, Some(1.0)), (0.0, 0.0));
+
+        prev.rx = 10_000;
+        prev.tx = 20_000;
+        prev.initialized = true;
+        assert_eq!(
+            net_rates(&prev, 12_000, 26_000, Some(2.0)),
+            (1_000.0, 3_000.0)
+        );
+        assert_eq!(net_rates(&prev, 100, 200, Some(1.0)), (0.0, 0.0));
+        assert_eq!(net_rates(&prev, 12_000, 26_000, None), (0.0, 0.0));
+    }
+
+    #[test]
+    fn disappeared_interfaces_drop_their_baselines() {
+        let mut collector = NetCollector::new();
+        collector.prev.insert("eth0".into(), Prev::default());
+        collector.prev.insert("gone0".into(), Prev::default());
+        collector.retain_seen(&HashSet::from(["eth0".to_string()]));
+        assert!(collector.prev.contains_key("eth0"));
+        assert!(!collector.prev.contains_key("gone0"));
     }
 }

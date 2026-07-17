@@ -7,6 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use super::Collector;
@@ -210,7 +211,18 @@ fn collect_amdgpu(
     out: &mut HashMap<i32, GpuProcUse>,
     cur: &mut HashMap<(i32, u64), u64>,
 ) {
-    let Ok(procs) = fs::read_dir("/proc") else {
+    collect_amdgpu_at(Path::new("/proc"), pdev_idx, prev, dt, out, cur);
+}
+
+fn collect_amdgpu_at(
+    proc_root: &Path,
+    pdev_idx: &HashMap<String, usize>,
+    prev: &HashMap<(i32, u64), u64>,
+    dt: Option<f64>,
+    out: &mut HashMap<i32, GpuProcUse>,
+    cur: &mut HashMap<(i32, u64), u64>,
+) {
+    let Ok(procs) = fs::read_dir(proc_root) else {
         return;
     };
     for entry in procs.flatten() {
@@ -221,7 +233,8 @@ fn collect_amdgpu(
         else {
             continue;
         };
-        let Ok(fds) = fs::read_dir(format!("/proc/{pid}/fd")) else {
+        let proc_dir = proc_root.join(pid.to_string());
+        let Ok(fds) = fs::read_dir(proc_dir.join("fd")) else {
             continue;
         };
         let mut seen: HashSet<(String, u64)> = HashSet::new();
@@ -235,8 +248,8 @@ fn collect_amdgpu(
             if !target.to_string_lossy().starts_with("/dev/dri/") {
                 continue;
             }
-            let fdi = format!("/proc/{pid}/fdinfo/{}", fd.file_name().to_string_lossy());
-            let Ok(content) = fs::read_to_string(&fdi) else {
+            let fdi = proc_dir.join("fdinfo").join(fd.file_name());
+            let Ok(content) = fs::read_to_string(fdi) else {
                 continue;
             };
             let Some(info) = parse_fdinfo(&content) else {
@@ -256,21 +269,39 @@ fn collect_amdgpu(
         if seen.is_empty() {
             continue;
         }
-        let key = (pid, super::proc::read_starttime(pid));
+        let key = (pid, super::proc::read_starttime_at(proc_root, pid));
         cur.insert(key, engine);
-        let util = match (prev.get(&key), dt) {
-            (Some(&pe), Some(dt)) if dt > 0.0 => {
-                (engine.saturating_sub(pe) as f64 / (dt * 1e9) * 100.0) as f32
-            }
-            _ => 0.0,
-        };
+        let util = amd_util(prev.get(&key).copied(), engine, dt);
         indices.sort_unstable();
+        merge_gpu_use(out, pid, vram, util, "");
         let e = out.entry(pid).or_default();
-        e.vram += vram;
-        e.util_pct += util;
         for i in &indices {
             add_gpu_label(e, &format!("A{i}"));
         }
+    }
+}
+
+fn merge_gpu_use(
+    out: &mut HashMap<i32, GpuProcUse>,
+    pid: i32,
+    vram: u64,
+    util_pct: f32,
+    label: &str,
+) {
+    let usage = out.entry(pid).or_default();
+    usage.vram += vram;
+    usage.util_pct += util_pct;
+    if !label.is_empty() {
+        add_gpu_label(usage, label);
+    }
+}
+
+fn amd_util(prev_engine_ns: Option<u64>, engine_ns: u64, dt: Option<f64>) -> f32 {
+    match (prev_engine_ns, dt) {
+        (Some(prev), Some(dt)) if dt > 0.0 => {
+            (engine_ns.saturating_sub(prev) as f64 / (dt * 1e9) * 100.0) as f32
+        }
+        _ => 0.0,
     }
 }
 
@@ -319,37 +350,41 @@ fn collect_nvidia(
             remember_pid_vram(&mut mem_by_pid, p.pid, mem);
         }
         for (pid, mem) in mem_by_pid {
-            let e = out.entry(pid as i32).or_default();
-            e.vram += mem;
-            add_gpu_label(e, &label);
+            merge_gpu_use(out, pid as i32, mem, 0.0, &label);
         }
 
         // Utilization (best-effort: unsupported / no new samples -> skipped).
         // Only fetch samples newer than the previous tick's, instead of the
         // driver's whole sample buffer every time.
         if let Ok(samples) = dev.process_utilization_stats(last_ts.get(&i).copied()) {
-            let mut latest: HashMap<u32, (u64, u32)> = HashMap::new();
-            for s in samples {
-                let dev_ts = last_ts.entry(i).or_insert(0);
-                *dev_ts = (*dev_ts).max(s.timestamp);
-                let newer = latest
-                    .get(&s.pid)
-                    .map(|(t, _)| s.timestamp >= *t)
-                    .unwrap_or(true);
-                if newer {
-                    latest.insert(s.pid, (s.timestamp, s.sm_util));
-                }
-            }
+            let dev_ts = last_ts.entry(i).or_insert(0);
+            let latest = latest_process_samples(
+                samples.into_iter().map(|s| (s.pid, s.timestamp, s.sm_util)),
+                dev_ts,
+            );
             for (pid, (_, sm)) in latest {
-                let e = out.entry(pid as i32).or_default();
-                e.util_pct += sm as f32;
+                merge_gpu_use(out, pid as i32, 0, sm as f32, &label);
                 // Tag the GPU even when the pid wasn't in the VRAM process
                 // lists, so the GPU column isn't blank for a row that sorts
                 // high on GPU%.
-                add_gpu_label(e, &label);
             }
         }
     }
+}
+
+#[cfg(feature = "nvidia")]
+fn latest_process_samples(
+    samples: impl IntoIterator<Item = (u32, u64, u32)>,
+    last_timestamp: &mut u64,
+) -> HashMap<u32, (u64, u32)> {
+    let mut latest = HashMap::new();
+    for (pid, timestamp, sm_util) in samples {
+        *last_timestamp = (*last_timestamp).max(timestamp);
+        if latest.get(&pid).is_none_or(|(seen, _)| timestamp >= *seen) {
+            latest.insert(pid, (timestamp, sm_util));
+        }
+    }
+    latest
 }
 
 #[cfg(feature = "nvidia")]
@@ -362,7 +397,31 @@ fn remember_pid_vram(mem_by_pid: &mut HashMap<u32, u64>, pid: u32, mem: u64) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
+
+    static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDir(std::path::PathBuf);
+
+    impl TestDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "smtop-gpuproc-{}-{}",
+                std::process::id(),
+                NEXT_TMP.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     #[test]
     fn amd_fdinfo_dedup_key_includes_pci_device() {
@@ -401,6 +460,81 @@ drm-engine-capacity-dec:\t2
         assert_eq!(info.vram, 10240 * 1024);
     }
 
+    #[test]
+    fn amd_fdinfo_rejects_other_drivers_and_missing_client() {
+        assert!(parse_fdinfo("drm-driver: i915\ndrm-client-id: 1").is_none());
+        assert!(parse_fdinfo("drm-driver: amdgpu\ndrm-pdev: 0000:01:00.0").is_none());
+    }
+
+    #[test]
+    fn amd_size_util_and_labels_cover_boundaries() {
+        assert_eq!(parse_size("2 MiB"), 2 * 1024 * 1024);
+        assert_eq!(parse_size("1 GiB"), 1024 * 1024 * 1024);
+        assert_eq!(amd_util(None, 1_000_000_000, Some(1.0)), 0.0);
+        assert_eq!(amd_util(Some(1_000), 500_001_000, Some(1.0)), 50.0);
+        assert_eq!(amd_util(Some(1_000), 500, Some(1.0)), 0.0);
+
+        let mut usage = GpuProcUse::default();
+        add_gpu_label(&mut usage, "A0");
+        add_gpu_label(&mut usage, "A0");
+        add_gpu_label(&mut usage, "N1");
+        assert_eq!(usage.label, "A0,N1");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn amd_collection_deduplicates_fds_and_aggregates_multiple_gpus() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TestDir::new();
+        let proc_dir = tmp.0.join("42");
+        fs::create_dir_all(proc_dir.join("fd")).unwrap();
+        fs::create_dir_all(proc_dir.join("fdinfo")).unwrap();
+        fs::write(
+            proc_dir.join("stat"),
+            "42 (gpu worker) S 1 2 3 4 5 6 7 8 9 10 0 0 13 14 15 16 17 18 999",
+        )
+        .unwrap();
+
+        let info0 = "drm-driver: amdgpu\ndrm-client-id: 7\ndrm-pdev: 0000:05:00.0\ndrm-total-vram: 10 MiB\ndrm-engine-gfx: 1000000000 ns\n";
+        let info1 = "drm-driver: amdgpu\ndrm-client-id: 7\ndrm-pdev: 0000:06:00.0\ndrm-total-vram: 20 MiB\ndrm-engine-gfx: 2000000000 ns\n";
+        for (fd, info) in [("3", info0), ("4", info0), ("5", info1)] {
+            symlink("/dev/dri/renderD128", proc_dir.join("fd").join(fd)).unwrap();
+            fs::write(proc_dir.join("fdinfo").join(fd), info).unwrap();
+        }
+
+        let pdev = HashMap::from([
+            ("0000:05:00.0".to_string(), 0),
+            ("0000:06:00.0".to_string(), 1),
+        ]);
+        let prev = HashMap::from([((42, 999), 2_000_000_000)]);
+        let mut out = HashMap::new();
+        let mut cur = HashMap::new();
+        collect_amdgpu_at(&tmp.0, &pdev, &prev, Some(1.0), &mut out, &mut cur);
+
+        let usage = out.get(&42).unwrap();
+        assert_eq!(usage.vram, 30 * 1024 * 1024);
+        assert_eq!(usage.util_pct, 100.0);
+        assert_eq!(usage.label, "A0,A1");
+        assert_eq!(cur.get(&(42, 999)), Some(&3_000_000_000));
+    }
+
+    #[test]
+    fn vendor_results_merge_for_the_same_pid_without_duplicate_labels() {
+        let mut out = HashMap::new();
+        merge_gpu_use(&mut out, 42, 10, 20.0, "A0");
+        merge_gpu_use(&mut out, 42, 30, 40.0, "N0");
+        merge_gpu_use(&mut out, 42, 0, 5.0, "N0");
+        assert_eq!(
+            out.get(&42),
+            Some(&GpuProcUse {
+                vram: 40,
+                util_pct: 65.0,
+                label: "A0,N0".into(),
+            })
+        );
+    }
+
     #[cfg(feature = "nvidia")]
     #[test]
     fn nvidia_proc_vram_keeps_largest_duplicate_sample() {
@@ -411,5 +545,18 @@ drm-engine-capacity-dec:\t2
 
         assert_eq!(by_pid.get(&42), Some(&2048));
         assert_eq!(by_pid.len(), 1);
+    }
+
+    #[cfg(feature = "nvidia")]
+    #[test]
+    fn nvidia_proc_util_keeps_latest_sample_and_advances_timestamp() {
+        let mut timestamp = 100;
+        let latest = latest_process_samples(
+            [(7, 120, 30), (7, 110, 99), (8, 130, 40), (7, 140, 50)],
+            &mut timestamp,
+        );
+        assert_eq!(latest.get(&7), Some(&(140, 50)));
+        assert_eq!(latest.get(&8), Some(&(130, 40)));
+        assert_eq!(timestamp, 140);
     }
 }

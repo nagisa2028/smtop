@@ -182,26 +182,13 @@ impl Collector for FsCollector {
 
     fn sample(&mut self) -> anyhow::Result<Vec<FsSnapshot>> {
         let content = fs::read_to_string("/proc/mounts")?;
-        let mut seen = HashSet::new();
         let mut out = Vec::new();
 
-        for line in content.lines() {
-            let mut f = line.split_whitespace();
-            let _device = f.next();
-            let Some(mount_raw) = f.next() else { continue };
-            let Some(fstype) = f.next() else { continue };
-
-            if PSEUDO_FS.contains(&fstype) {
-                continue;
-            }
-            let mount = unescape_octal(mount_raw);
-            if !seen.insert(mount.clone()) {
-                continue;
-            }
+        for mount in parse_mounts(&content) {
             // Hung mounts: never probe again (each probe would leak a stuck
             // thread). Instead, periodically poll the parked worker.
             if let Some(h) = self.hung.get(&mount) {
-                if h.checked.elapsed() < RETRY_AFTER {
+                if !retry_due(h.checked, Instant::now()) {
                     continue;
                 }
                 match self.poll_hung(&mount) {
@@ -222,9 +209,40 @@ impl Collector for FsCollector {
             out.push(FsSnapshot { mount, used, total });
         }
         // Largest filesystems first.
-        out.sort_by_key(|f| std::cmp::Reverse(f.total));
+        sort_filesystems(&mut out);
         Ok(out)
     }
+}
+
+fn parse_mounts(content: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut mounts = Vec::new();
+    for line in content.lines() {
+        let mut fields = line.split_whitespace();
+        let _device = fields.next();
+        let Some(mount_raw) = fields.next() else {
+            continue;
+        };
+        let Some(fstype) = fields.next() else {
+            continue;
+        };
+        if PSEUDO_FS.contains(&fstype) {
+            continue;
+        }
+        let mount = unescape_octal(mount_raw);
+        if seen.insert(mount.clone()) {
+            mounts.push(mount);
+        }
+    }
+    mounts
+}
+
+fn retry_due(checked: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(checked) >= RETRY_AFTER
+}
+
+fn sort_filesystems(filesystems: &mut [FsSnapshot]) {
+    filesystems.sort_by_key(|f| std::cmp::Reverse(f.total));
 }
 
 /// Decode `\NNN` octal escapes that `/proc/mounts` uses for special chars.
@@ -313,5 +331,35 @@ mod tests {
     fn unescape_octal_multibyte_after_backslash_no_panic() {
         // A multibyte char right after `\` must not panic on byte slicing.
         assert_eq!(unescape_octal("/mnt/\\あ"), "/mnt/\\あ");
+    }
+
+    #[test]
+    fn mount_parser_filters_pseudo_filesystems_decodes_and_deduplicates() {
+        let mounts = parse_mounts(
+            "dev / ext4 rw 0 0\nproc /proc proc rw 0 0\nother / ext4 rw 0 0\ndev /mnt/my\\040disk xfs rw 0 0\nbad\n",
+        );
+        assert_eq!(mounts, ["/", "/mnt/my disk"]);
+    }
+
+    #[test]
+    fn retry_boundary_and_filesystem_sorting_are_deterministic() {
+        let now = Instant::now();
+        assert!(!retry_due(now - Duration::from_secs(59), now));
+        assert!(retry_due(now - RETRY_AFTER, now));
+
+        let mut filesystems = [
+            FsSnapshot {
+                mount: "/small".into(),
+                used: 1,
+                total: 10,
+            },
+            FsSnapshot {
+                mount: "/large".into(),
+                used: 1,
+                total: 100,
+            },
+        ];
+        sort_filesystems(&mut filesystems);
+        assert_eq!(filesystems[0].mount, "/large");
     }
 }

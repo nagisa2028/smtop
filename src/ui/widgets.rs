@@ -98,3 +98,42 @@ pub fn fmt_rate(bps: f64) -> String {
         format!("{v:.1}{}", U[i])
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn usage_color_thresholds_are_inclusive() {
+        assert_eq!(usage_color(39.9), Color::Cyan);
+        assert_eq!(usage_color(40.0), Color::Green);
+        assert_eq!(usage_color(70.0), Color::Yellow);
+        assert_eq!(usage_color(90.0), Color::Red);
+    }
+
+    #[test]
+    fn horizontal_bar_clamps_and_keeps_width() {
+        assert_eq!(hbar(-1.0, 2), "  ");
+        assert_eq!(hbar(12.5, 1), "▏");
+        assert_eq!(hbar(50.0, 2), "█ ");
+        assert_eq!(hbar(101.0, 2), "██");
+        assert_eq!(hbar(50.0, 0), "");
+    }
+
+    #[test]
+    fn formatters_cover_unit_boundaries() {
+        assert_eq!(fmt_bytes(0), "0B");
+        assert_eq!(fmt_bytes(1023), "1023B");
+        assert_eq!(fmt_bytes(1024), "1.0K");
+        assert_eq!(fmt_bytes(1024 * 1024), "1.0M");
+        assert_eq!(fmt_rate(-1.0), "0B/s");
+        assert_eq!(fmt_rate(1024.0), "1.0K/s");
+        assert_eq!(fmt_rate(100.0 * 1024.0), "100K/s");
+        assert_eq!(fmt_link(999), "999M");
+        assert_eq!(fmt_link(1000), "1G");
+        assert_eq!(fmt_link(2500), "2.5G");
+        assert_eq!(fmt_uptime(59), "0m");
+        assert_eq!(fmt_uptime(3600), "1h 0m");
+        assert_eq!(fmt_uptime(86_400), "1d 0h");
+    }
+}

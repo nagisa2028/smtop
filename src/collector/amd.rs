@@ -43,99 +43,101 @@ impl Collector for AmdCollector {
     }
 
     fn sample(&mut self) -> anyhow::Result<Vec<GpuSnapshot>> {
-        let mut out = Vec::new();
-        for (idx, dev) in enumerate_amdgpu_cards().into_iter().enumerate() {
-            let key = dev.to_string_lossy().into_owned();
+        Ok(enumerate_amdgpu_cards()
+            .into_iter()
+            .enumerate()
+            .map(|(idx, dev)| sample_device(idx, &dev, &mut self.hist))
+            .collect())
+    }
+}
 
-            // Prefer the binary gpu_metrics table: on newer discrete cards
-            // (e.g. RDNA4 / Navi 48) the legacy gpu_busy_percent and hwmon
-            // sensors return EBUSY, but gpu_metrics is populated. Fall back to
-            // the legacy sysfs nodes (which APUs expose) when metrics are absent.
-            let metrics_res = read_gpu_metrics(&dev);
-            let metrics = metrics_res.as_ref().ok().copied();
+fn sample_device(idx: usize, dev: &Path, histories: &mut HashMap<String, Hist>) -> GpuSnapshot {
+    let key = dev.to_string_lossy().into_owned();
 
-            let mem_used = read_u64(dev.join("mem_info_vram_used")).unwrap_or(0);
-            let mem_total = read_u64(dev.join("mem_info_vram_total")).unwrap_or(0);
-            let gtt = match (
-                read_u64(dev.join("mem_info_gtt_used")),
-                read_u64(dev.join("mem_info_gtt_total")),
-            ) {
-                (Some(u), Some(t)) if t > 0 => Some((u, t)),
-                _ => None,
-            };
+    // Prefer gpu_metrics, falling back to legacy sysfs when absent/unreadable.
+    let metrics_res = read_gpu_metrics(dev);
+    let metrics = metrics_res.as_ref().ok().copied();
+    let mem_used = read_u64(dev.join("mem_info_vram_used")).unwrap_or(0);
+    let mem_total = read_u64(dev.join("mem_info_vram_total")).unwrap_or(0);
+    let gtt = match (
+        read_u64(dev.join("mem_info_gtt_used")),
+        read_u64(dev.join("mem_info_gtt_total")),
+    ) {
+        (Some(u), Some(t)) if t > 0 => Some((u, t)),
+        _ => None,
+    };
 
-            let (hw_temp, hw_power, hw_fan) = read_hwmon(&dev);
-            let m = metrics.as_ref();
-            let busy_pct = m
-                .map(|m| m.gfx_activity)
-                .or_else(|| read_u64(dev.join("gpu_busy_percent")).map(|v| v as f32))
-                .unwrap_or(0.0);
-            let temp_c = m.and_then(|m| m.temp_c).or(hw_temp);
-            let power_w = m.and_then(|m| m.power_w).or(hw_power);
-            let fan = m.and_then(|m| m.fan_rpm).map(Fan::Rpm).or(hw_fan);
-            let sclk_mhz = m
-                .and_then(|m| m.sclk_mhz)
-                .or_else(|| read_current_clock(dev.join("pp_dpm_sclk")));
-            let mclk_mhz = m
-                .and_then(|m| m.mclk_mhz)
-                .or_else(|| read_current_clock(dev.join("pp_dpm_mclk")));
-            let name = read_name(&dev);
-            let suspended = fs::read_to_string(dev.join("power/runtime_status"))
-                .map(|s| s.trim() == "suspended")
-                .unwrap_or(false);
-            // Explain missing telemetry from an undecodable metrics revision.
-            let note = match metrics_res {
-                Err(GpuMetricsErr::Unsupported { format, content })
-                    if temp_c.is_none() && power_w.is_none() && !suspended =>
-                {
-                    Some(format!("gpu_metrics v{format}.{content} unsupported"))
-                }
-                _ => None,
-            };
-
-            let h = self.hist.entry(key).or_default();
-            h.util.push(busy_pct as f64);
-            let vram_pct = if mem_total > 0 {
-                100.0 * mem_used as f64 / mem_total as f64
-            } else {
-                0.0
-            };
-            h.vram.push(vram_pct);
-
-            out.push(GpuSnapshot {
-                vendor: GpuVendor::Amd,
-                index: idx,
-                name,
-                busy_pct,
-                util_hist: h.util.clone(),
-                mem_used,
-                mem_total,
-                gtt,
-                vram_hist: h.vram.clone(),
-                temp_c,
-                power_w,
-                sclk_mhz,
-                mclk_mhz,
-                fan,
-                pcie_rx_bps: None,
-                pcie_tx_bps: None,
-                pcie_width: m.and_then(|m| m.pcie_width),
-                // amdgpu doesn't expose VCN enc/dec engine util via sysfs.
-                enc_pct: None,
-                dec_pct: None,
-                suspended,
-                note,
-            });
+    let (hw_temp, hw_power, hw_fan) = read_hwmon(dev);
+    let m = metrics.as_ref();
+    let busy_pct = m
+        .map(|m| m.gfx_activity)
+        .or_else(|| read_u64(dev.join("gpu_busy_percent")).map(|v| v as f32))
+        .unwrap_or(0.0);
+    let temp_c = m.and_then(|m| m.temp_c).or(hw_temp);
+    let power_w = m.and_then(|m| m.power_w).or(hw_power);
+    let fan = m.and_then(|m| m.fan_rpm).map(Fan::Rpm).or(hw_fan);
+    let sclk_mhz = m
+        .and_then(|m| m.sclk_mhz)
+        .or_else(|| read_current_clock(dev.join("pp_dpm_sclk")));
+    let mclk_mhz = m
+        .and_then(|m| m.mclk_mhz)
+        .or_else(|| read_current_clock(dev.join("pp_dpm_mclk")));
+    let name = read_name(dev);
+    let suspended = fs::read_to_string(dev.join("power/runtime_status"))
+        .map(|s| s.trim() == "suspended")
+        .unwrap_or(false);
+    let note = match metrics_res {
+        Err(GpuMetricsErr::Unsupported { format, content })
+            if temp_c.is_none() && power_w.is_none() && !suspended =>
+        {
+            Some(format!("gpu_metrics v{format}.{content} unsupported"))
         }
-        Ok(out)
+        _ => None,
+    };
+
+    let h = histories.entry(key).or_default();
+    h.util.push(busy_pct as f64);
+    let vram_pct = if mem_total > 0 {
+        100.0 * mem_used as f64 / mem_total as f64
+    } else {
+        0.0
+    };
+    h.vram.push(vram_pct);
+
+    GpuSnapshot {
+        vendor: GpuVendor::Amd,
+        index: idx,
+        name,
+        busy_pct,
+        util_hist: h.util.clone(),
+        mem_used,
+        mem_total,
+        gtt,
+        vram_hist: h.vram.clone(),
+        temp_c,
+        power_w,
+        sclk_mhz,
+        mclk_mhz,
+        fan,
+        pcie_rx_bps: None,
+        pcie_tx_bps: None,
+        pcie_width: m.and_then(|m| m.pcie_width),
+        enc_pct: None,
+        dec_pct: None,
+        suspended,
+        note,
     }
 }
 
 /// Find `/sys/class/drm/cardN/device` dirs whose driver is `amdgpu`,
 /// skipping connector entries like `card1-DP-1`.
 fn enumerate_amdgpu_cards() -> Vec<PathBuf> {
+    enumerate_amdgpu_cards_at(Path::new("/sys/class/drm"))
+}
+
+fn enumerate_amdgpu_cards_at(root: &Path) -> Vec<PathBuf> {
     let mut cards = Vec::new();
-    let Ok(entries) = fs::read_dir("/sys/class/drm") else {
+    let Ok(entries) = fs::read_dir(root) else {
         return cards;
     };
     for entry in entries.flatten() {
@@ -390,7 +392,31 @@ fn parse_current_clock(content: &str) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
+
+    static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "smtop-amd-{}-{}",
+                std::process::id(),
+                NEXT_TMP.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     /// Build a synthetic gpu_metrics v1_3 buffer with known field values.
     fn metrics_buf() -> [u8; 120] {
@@ -523,5 +549,79 @@ mod tests {
         assert_eq!(marketing_name("Barcelo"), "Barcelo");
         // Degenerate brackets fall back to the original string.
         assert_eq!(marketing_name("Weird []"), "Weird []");
+    }
+
+    #[test]
+    fn sysfs_fallback_builds_complete_snapshot_and_history() {
+        let tmp = TestDir::new();
+        let dev = &tmp.0;
+        fs::write(dev.join("uevent"), "PCI_ID=1002:15E7\n").unwrap();
+        fs::write(dev.join("mem_info_vram_used"), "1024\n").unwrap();
+        fs::write(dev.join("mem_info_vram_total"), "4096\n").unwrap();
+        fs::write(dev.join("mem_info_gtt_used"), "2048\n").unwrap();
+        fs::write(dev.join("mem_info_gtt_total"), "8192\n").unwrap();
+        fs::write(dev.join("gpu_busy_percent"), "55\n").unwrap();
+        fs::write(dev.join("pp_dpm_sclk"), "0: 400Mhz *\n").unwrap();
+        fs::write(dev.join("pp_dpm_mclk"), "0: 800Mhz *\n").unwrap();
+        fs::create_dir_all(dev.join("power")).unwrap();
+        fs::write(dev.join("power/runtime_status"), "active\n").unwrap();
+        let hwmon = dev.join("hwmon/hwmon0");
+        fs::create_dir_all(&hwmon).unwrap();
+        fs::write(hwmon.join("name"), "amdgpu\n").unwrap();
+        fs::write(hwmon.join("temp1_input"), "65000\n").unwrap();
+        fs::write(hwmon.join("power1_average"), "12000000\n").unwrap();
+        fs::write(hwmon.join("fan1_input"), "900\n").unwrap();
+
+        let mut histories = HashMap::new();
+        let snapshot = sample_device(2, dev, &mut histories);
+        assert_eq!(snapshot.index, 2);
+        assert_eq!(snapshot.name, "Barcelo");
+        assert_eq!(snapshot.busy_pct, 55.0);
+        assert_eq!((snapshot.mem_used, snapshot.mem_total), (1024, 4096));
+        assert_eq!(snapshot.gtt, Some((2048, 8192)));
+        assert_eq!(snapshot.temp_c, Some(65.0));
+        assert_eq!(snapshot.power_w, Some(12.0));
+        assert!(matches!(snapshot.fan, Some(Fan::Rpm(900))));
+        assert_eq!(snapshot.sclk_mhz, Some(400));
+        assert_eq!(snapshot.mclk_mhz, Some(800));
+        assert_eq!(snapshot.util_hist.points().len(), 1);
+        assert_eq!(snapshot.vram_hist.points().last().map(|p| p.1), Some(25.0));
+    }
+
+    #[test]
+    fn card_enumeration_skips_connectors_and_other_drivers() {
+        let tmp = TestDir::new();
+        for (name, driver) in [
+            ("card2", "amdgpu"),
+            ("card0", "i915"),
+            ("card1-DP-1", "amdgpu"),
+            ("renderD128", "amdgpu"),
+        ] {
+            let dev = tmp.0.join(name).join("device");
+            fs::create_dir_all(&dev).unwrap();
+            fs::write(dev.join("uevent"), format!("DRIVER={driver}\n")).unwrap();
+        }
+        assert_eq!(
+            enumerate_amdgpu_cards_at(&tmp.0),
+            [tmp.0.join("card2/device")]
+        );
+    }
+
+    #[test]
+    fn unsupported_metrics_note_is_suppressed_while_suspended() {
+        let tmp = TestDir::new();
+        let mut metrics = metrics_buf();
+        metrics[3] = 4;
+        fs::write(tmp.0.join("gpu_metrics"), metrics).unwrap();
+        fs::create_dir_all(tmp.0.join("power")).unwrap();
+        fs::write(tmp.0.join("power/runtime_status"), "active\n").unwrap();
+        let mut histories = HashMap::new();
+        let active = sample_device(0, &tmp.0, &mut histories);
+        assert_eq!(active.note.as_deref(), Some("gpu_metrics v1.4 unsupported"));
+
+        fs::write(tmp.0.join("power/runtime_status"), "suspended\n").unwrap();
+        let suspended = sample_device(0, &tmp.0, &mut histories);
+        assert!(suspended.suspended);
+        assert!(suspended.note.is_none());
     }
 }
