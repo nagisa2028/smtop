@@ -18,16 +18,21 @@ impl CpuTimes {
     /// rejects the whole line — silently dropping one would shift the
     /// position-dependent fields after it.
     fn parse(fields: &str) -> Option<Self> {
-        let vals: Vec<u64> = fields
-            .split_whitespace()
-            .map(|f| f.parse().ok())
-            .collect::<Option<_>>()?;
-        if vals.len() < 4 {
+        let mut idle = 0;
+        let mut total = 0;
+        let mut count = 0;
+        for (i, field) in fields.split_whitespace().enumerate() {
+            let value: u64 = field.parse().ok()?;
+            if i == 3 || i == 4 {
+                idle += value;
+            }
+            total += value;
+            count += 1;
+        }
+        if count < 4 {
             return None;
         }
         // user nice system idle iowait irq softirq steal ...
-        let idle = vals[3] + vals.get(4).copied().unwrap_or(0); // idle + iowait
-        let total: u64 = vals.iter().sum();
         Some(Self { idle, total })
     }
 

@@ -4,7 +4,7 @@
 //! history-bearing snapshot into `SharedState` via `ArcSwap` (lock-free). The UI
 //! renders whatever is latest at its own frame rate, decoupled from collection.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::time::Instant;
 
 use arc_swap::ArcSwapOption;
@@ -39,25 +39,38 @@ pub const HIST_CAP: usize = 120;
 /// A fixed-capacity ring buffer of `f64` samples for time-series charts.
 #[derive(Clone, Debug, Default)]
 pub struct History {
-    buf: VecDeque<f64>,
+    /// Chart-ready points. Keeping the x coordinates here avoids rebuilding
+    /// and allocating every series on every UI frame (the UI redraws more
+    /// often than collectors publish).
+    points: Vec<(f64, f64)>,
 }
 
 impl History {
     pub fn new() -> Self {
         Self {
-            buf: VecDeque::with_capacity(HIST_CAP),
+            points: Vec::with_capacity(HIST_CAP),
         }
     }
 
     pub fn push(&mut self, v: f64) {
-        if self.buf.len() == HIST_CAP {
-            self.buf.pop_front();
+        if self.points.len() == HIST_CAP {
+            // The x coordinates remain 0..HIST_CAP; only slide the samples.
+            for i in 1..HIST_CAP {
+                self.points[i - 1].1 = self.points[i].1;
+            }
+            self.points[HIST_CAP - 1].1 = v;
+        } else {
+            // Histories are right-aligned while filling, so existing points
+            // move one column left before the newest point is appended.
+            for (x, _) in &mut self.points {
+                *x -= 1.0;
+            }
+            self.points.push(((HIST_CAP - 1) as f64, v));
         }
-        self.buf.push_back(v);
     }
 
     pub fn max(&self) -> f64 {
-        self.buf.iter().copied().fold(0.0_f64, f64::max)
+        self.points.iter().map(|&(_, y)| y).fold(0.0_f64, f64::max)
     }
 
     /// `(x, y)` points for a ratatui `Chart` over a fixed `0..HIST_CAP` x-axis.
@@ -66,13 +79,55 @@ impl History {
     /// (`x = HIST_CAP - 1`) and older samples extend left, leaving the left
     /// blank until the buffer fills. This keeps "newest on the right" stable
     /// instead of rescaling the whole graph while history accumulates.
-    pub fn points(&self) -> Vec<(f64, f64)> {
-        let offset = HIST_CAP - self.buf.len();
-        self.buf
-            .iter()
-            .enumerate()
-            .map(|(i, &v)| ((offset + i) as f64, v))
-            .collect()
+    pub fn points(&self) -> &[(f64, f64)] {
+        &self.points
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn history_is_right_aligned_and_bounded() {
+        let mut history = History::new();
+        history.push(10.0);
+        history.push(20.0);
+        assert_eq!(
+            history.points(),
+            &[((HIST_CAP - 2) as f64, 10.0), ((HIST_CAP - 1) as f64, 20.0),]
+        );
+
+        for value in 2..=HIST_CAP {
+            history.push(value as f64);
+        }
+        assert_eq!(history.points().len(), HIST_CAP);
+        assert_eq!(history.points().first(), Some(&(0.0, 20.0)));
+        assert_eq!(
+            history.points().last(),
+            Some(&((HIST_CAP - 1) as f64, HIST_CAP as f64))
+        );
+        assert_eq!(history.max(), HIST_CAP as f64);
+    }
+
+    #[test]
+    fn history_evicts_old_peak_and_clones_independently() {
+        let mut history = History::new();
+        assert_eq!(history.max(), 0.0);
+        history.push(10_000.0);
+        for value in 1..HIST_CAP {
+            history.push(value as f64);
+        }
+        assert_eq!(history.max(), 10_000.0);
+
+        let mut cloned = history.clone();
+        history.push(HIST_CAP as f64); // evicts the old 10_000 peak
+        assert_eq!(history.max(), HIST_CAP as f64);
+        assert_eq!(history.points().first(), Some(&(0.0, 1.0)));
+
+        cloned.push(50_000.0);
+        assert_eq!(cloned.max(), 50_000.0);
+        assert_eq!(history.max(), HIST_CAP as f64);
     }
 }
 

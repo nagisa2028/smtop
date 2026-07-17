@@ -288,7 +288,12 @@ fn render_overview(frame: &mut Frame, area: Rect, state: &SharedState) {
         render_cpu(frame, tiers[0], cpu);
     }
 
-    let gpus = collect_gpus(state);
+    let nvidia = state.nvidia.load_full();
+    let amd = state.amd.load_full();
+    let gpus = collect_gpus(
+        nvidia.as_deref().map(|g| g.as_slice()).unwrap_or(&[]),
+        amd.as_deref().map(|g| g.as_slice()).unwrap_or(&[]),
+    );
     render_gpus(frame, tiers[1], &gpus);
 
     let net = state.net.load_full();
@@ -305,15 +310,8 @@ fn render_overview(frame: &mut Frame, area: Rect, state: &SharedState) {
 
 /// Combined GPU list across both vendors, nvidia first then amd (the order the
 /// `index`/tag scheme and the Overview cards use).
-fn collect_gpus(state: &SharedState) -> Vec<GpuSnapshot> {
-    let mut gpus = Vec::new();
-    if let Some(nv) = state.nvidia.load_full() {
-        gpus.extend(nv.iter().cloned());
-    }
-    if let Some(amd) = state.amd.load_full() {
-        gpus.extend(amd.iter().cloned());
-    }
-    gpus
+fn collect_gpus<'a>(nvidia: &'a [GpuSnapshot], amd: &'a [GpuSnapshot]) -> Vec<&'a GpuSnapshot> {
+    nvidia.iter().chain(amd).collect()
 }
 
 /// The per-process GPU tag a snapshot corresponds to (`N0`, `A1`, …), matching
@@ -329,12 +327,12 @@ fn gpu_tag(g: &GpuSnapshot) -> String {
 /// Processes touching the GPU identified by `tag`, as `(pid, util%, vram, name)`
 /// rows sorted by GPU% (then VRAM) descending. A process's comma-separated
 /// label is matched token-exact so `N0` doesn't also match `N1`.
-fn procs_for_gpu(
+fn procs_for_gpu<'a>(
     tag: &str,
     gpu_procs: &HashMap<i32, GpuProcUse>,
-    name_of: &HashMap<i32, String>,
-) -> Vec<(i32, f32, u64, String)> {
-    let mut rows: Vec<(i32, f32, u64, String)> = gpu_procs
+    name_of: &HashMap<i32, &'a str>,
+) -> Vec<(i32, f32, u64, &'a str)> {
+    let mut rows: Vec<(i32, f32, u64, &str)> = gpu_procs
         .iter()
         .filter(|(_, g)| g.label.split(',').any(|t| t == tag))
         .map(|(&pid, g)| {
@@ -342,7 +340,7 @@ fn procs_for_gpu(
                 pid,
                 g.util_pct,
                 g.vram,
-                name_of.get(&pid).cloned().unwrap_or_default(),
+                name_of.get(&pid).copied().unwrap_or(""),
             )
         })
         .collect();
@@ -354,7 +352,12 @@ fn procs_for_gpu(
 /// enc/dec, and that GPU's process list), stacked vertically. `↑↓` highlights
 /// the selected band.
 fn render_gpu_tab(frame: &mut Frame, area: Rect, state: &SharedState, view: &View) {
-    let gpus = collect_gpus(state);
+    let nvidia = state.nvidia.load_full();
+    let amd = state.amd.load_full();
+    let gpus = collect_gpus(
+        nvidia.as_deref().map(|g| g.as_slice()).unwrap_or(&[]),
+        amd.as_deref().map(|g| g.as_slice()).unwrap_or(&[]),
+    );
     if gpus.is_empty() {
         let block = Block::bordered().title(" GPU ".bold());
         let inner = block.inner(area);
@@ -365,10 +368,10 @@ fn render_gpu_tab(frame: &mut Frame, area: Rect, state: &SharedState, view: &Vie
     let sel = view.gpu_sel.min(gpus.len() - 1);
 
     // pid -> name, built once for the per-GPU process lists.
-    let name_of: HashMap<i32, String> = state
-        .procs
-        .load_full()
-        .map(|p| p.iter().map(|pi| (pi.pid, pi.name.clone())).collect())
+    let procs = state.procs.load_full();
+    let name_of: HashMap<i32, &str> = procs
+        .as_deref()
+        .map(|p| p.iter().map(|pi| (pi.pid, pi.name.as_str())).collect())
         .unwrap_or_default();
     let gpu_procs = state.gpu_procs.load_full();
 
@@ -391,7 +394,7 @@ fn render_gpu_band(
     g: &GpuSnapshot,
     selected: bool,
     gpu_procs: Option<&HashMap<i32, GpuProcUse>>,
-    name_of: &HashMap<i32, String>,
+    name_of: &HashMap<i32, &str>,
 ) {
     let (color, sym) = match g.vendor {
         GpuVendor::Nvidia => (Color::Green, "⬢"),
@@ -428,10 +431,7 @@ fn render_gpu_band(
 
     let pts = g.util_hist.points();
     let vram_pts = g.vram_hist.points();
-    let series = [
-        (usage_color(g.busy_pct), pts.as_slice()),
-        (Color::Blue, vram_pts.as_slice()),
-    ];
+    let series = [(usage_color(g.busy_pct), pts), (Color::Blue, vram_pts)];
     frame.render_widget(line_chart(&series, 100.0, pct_labels()), rows[0]);
 
     let vram_pct = pct(g.mem_used, g.mem_total);
@@ -510,7 +510,7 @@ fn render_gpu_procs(
     area: Rect,
     g: &GpuSnapshot,
     gpu_procs: Option<&HashMap<i32, GpuProcUse>>,
-    name_of: &HashMap<i32, String>,
+    name_of: &HashMap<i32, &str>,
 ) {
     if area.height == 0 {
         return;
@@ -768,7 +768,9 @@ fn render_processes(frame: &mut Frame, area: Rect, state: &SharedState, view: &V
     let gpu_util = |pid: i32| gpu_of(pid).map_or(0.0, |g| g.util_pct);
     let gpu_vram = |pid: i32| gpu_of(pid).map_or(0, |g| g.vram);
 
-    let mut list: Vec<ProcInfo> = procs.to_vec();
+    // Sort lightweight references: cloning ProcInfo here used to duplicate
+    // every command-line String four times per second.
+    let mut list: Vec<&ProcInfo> = procs.iter().collect();
     match view.proc_sort {
         ProcSort::Cpu => list.sort_by(|a, b| b.cpu_pct.total_cmp(&a.cpu_pct)),
         ProcSort::Mem => list.sort_by_key(|p| std::cmp::Reverse(p.rss)),
@@ -916,10 +918,7 @@ fn render_cpu(frame: &mut Frame, area: Rect, cpu: &CpuSnapshot) {
     // Usage time-series.
     let pts = cpu.usage_hist.points();
     let mem_pts = cpu.mem_hist.points();
-    let series = [
-        (Color::Cyan, pts.as_slice()),
-        (Color::Magenta, mem_pts.as_slice()),
-    ];
+    let series = [(Color::Cyan, pts), (Color::Magenta, mem_pts)];
     let chart =
         line_chart(&series, 100.0, pct_labels()).block(Block::bordered().title(Line::from(vec![
             Span::styled("usage", Style::new().fg(Color::Cyan)),
@@ -1047,7 +1046,7 @@ fn render_cpu(frame: &mut Frame, area: Rect, cpu: &CpuSnapshot) {
     frame.render_widget(Paragraph::new(lines), rows[1]);
 }
 
-fn render_gpus(frame: &mut Frame, area: Rect, gpus: &[GpuSnapshot]) {
+fn render_gpus(frame: &mut Frame, area: Rect, gpus: &[&GpuSnapshot]) {
     if gpus.is_empty() {
         let block = Block::bordered().title(" GPU ".bold());
         let inner = block.inner(area);
@@ -1098,10 +1097,7 @@ fn render_gpu_card(frame: &mut Frame, area: Rect, g: &GpuSnapshot) {
 
     let pts = g.util_hist.points();
     let vram_pts = g.vram_hist.points();
-    let series = [
-        (usage_color(g.busy_pct), pts.as_slice()),
-        (Color::Blue, vram_pts.as_slice()),
-    ];
+    let series = [(usage_color(g.busy_pct), pts), (Color::Blue, vram_pts)];
     frame.render_widget(line_chart(&series, 100.0, pct_labels()), rows[0]);
 
     let vram_pct = pct(g.mem_used, g.mem_total);
@@ -1257,7 +1253,7 @@ fn render_net(frame: &mut Frame, area: Rect, net: &[NetSnapshot]) {
         let ymax = top.rx_hist.max().max(top.tx_hist.max());
         frame.render_widget(
             line_chart(
-                &[(Color::Green, &rx), (Color::Blue, &tx)],
+                &[(Color::Green, rx), (Color::Blue, tx)],
                 ymax,
                 rate_labels(ymax),
             ),
@@ -1325,7 +1321,7 @@ fn render_disk(frame: &mut Frame, area: Rect, disk: &[DiskSnapshot]) {
         ));
         frame.render_widget(
             line_chart(
-                &[(Color::Cyan, &r), (Color::Magenta, &w)],
+                &[(Color::Cyan, r), (Color::Magenta, w)],
                 ymax,
                 rate_labels(ymax),
             )
@@ -1712,9 +1708,9 @@ mod tests {
                 label: "A1".into(),
             },
         );
-        let mut names: HashMap<i32, String> = HashMap::new();
-        names.insert(10, "ten".into());
-        names.insert(11, "eleven".into());
+        let mut names: HashMap<i32, &str> = HashMap::new();
+        names.insert(10, "ten");
+        names.insert(11, "eleven");
 
         let rows = procs_for_gpu("N0", &gp, &names);
         let pids: Vec<i32> = rows.iter().map(|r| r.0).collect();
