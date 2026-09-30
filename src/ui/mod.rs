@@ -4,6 +4,7 @@ mod widgets;
 
 use std::collections::HashMap;
 use std::io;
+use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -314,30 +315,6 @@ fn gpu_count(state: &SharedState) -> usize {
 }
 
 fn render_overview(frame: &mut Frame, area: Rect, state: &SharedState) {
-    // Responsive tier heights. The CPU tier grows to fit the per-core grid
-    // (which expands with core/socket count), keeping ≥6 rows for GPUs.
-    let cpu = state.cpu.load_full();
-    let bot_h = if area.height >= 26 { 10 } else { 8 };
-    let top_region = if area.height >= 30 { 7 } else { 5 }; // chart + gauges
-    let inner_w = area.width.saturating_sub(2).max(1) as usize;
-    let core_rows = cpu
-        .as_ref()
-        .map(|c| cpu_core_rows(&c.core_groups, inner_w))
-        .unwrap_or(2);
-    let cpu_inner_max = (area.height as usize).saturating_sub(2 + 6 + bot_h as usize);
-    let cpu_inner = (top_region + core_rows).clamp(5, cpu_inner_max.max(5));
-    let cpu_h = (cpu_inner + 2) as u16;
-    let tiers = Layout::vertical([
-        Constraint::Length(cpu_h), // ① CPU / RAM
-        Constraint::Min(6),        // ② GPU cards
-        Constraint::Length(bot_h), // ③ Network | Disk | Free
-    ])
-    .split(area);
-
-    if let Some(cpu) = &cpu {
-        render_cpu(frame, tiers[0], cpu);
-    }
-
     let nvidia = state.nvidia.load_full();
     let amd = state.amd.load_full();
     let intel = state.intel.load_full();
@@ -346,6 +323,42 @@ fn render_overview(frame: &mut Frame, area: Rect, state: &SharedState) {
         amd.as_deref().map(|g| g.as_slice()).unwrap_or(&[]),
         intel.as_deref().map(|g| g.as_slice()).unwrap_or(&[]),
     );
+
+    // Responsive tier heights. The CPU tier grows to fit the per-core grid
+    // (which expands with core/socket count), keeping ≥6 rows for GPUs. With
+    // no GPU the tier shrinks to its one-line notice and the spare rows are
+    // shared between the CPU and bottom tiers.
+    let cpu = state.cpu.load_full();
+    let bot_h = if area.height >= 26 { 10 } else { 8 };
+    let gpu_h: u16 = if gpus.is_empty() { 3 } else { 6 };
+    let top_region = if area.height >= 30 { 7 } else { 5 }; // chart + gauges
+    let inner_w = area.width.saturating_sub(2).max(1) as usize;
+    let cpu_inner_max = (area.height as usize).saturating_sub(2 + (gpu_h + bot_h) as usize);
+    let core_rows = cpu
+        .as_ref()
+        .map(|c| cpu_grid_layout(&c.core_groups, inner_w, cpu_inner_max).1)
+        .unwrap_or(2);
+    let cpu_inner = (top_region + core_rows).clamp(5, cpu_inner_max.max(5));
+    let mut cpu_h = (cpu_inner + 2) as u16;
+    let mut bot_h = bot_h;
+    let gpu_c = if gpus.is_empty() {
+        let spare = area.height.saturating_sub(cpu_h + gpu_h + bot_h);
+        cpu_h += spare / 2;
+        bot_h += spare - spare / 2;
+        Constraint::Length(gpu_h)
+    } else {
+        Constraint::Min(gpu_h)
+    };
+    let tiers = Layout::vertical([
+        Constraint::Length(cpu_h), // ① CPU / RAM
+        gpu_c,                     // ② GPU cards
+        Constraint::Length(bot_h), // ③ Network | Disk | Free
+    ])
+    .split(area);
+
+    if let Some(cpu) = &cpu {
+        render_cpu(frame, tiers[0], cpu);
+    }
     render_gpus(frame, tiers[1], &gpus);
 
     let net = state.net.load_full();
@@ -490,8 +503,14 @@ fn render_gpu_band(
 
     let pts = g.util_hist.points();
     let vram_pts = g.vram_hist.points();
-    let series = [(usage_color(g.busy_pct), pts), (Color::Blue, vram_pts)];
-    frame.render_widget(line_chart(&series, 100.0, pct_labels()), rows[0]);
+    let util_c = usage_color(g.busy_pct);
+    let series = [(util_c, pts), (Color::Blue, vram_pts)];
+    render_pct_chart(
+        frame,
+        rows[0],
+        &series,
+        legend(("util", util_c), ("vram", Color::Blue), " %"),
+    );
 
     let vram_pct = pct(g.mem_used, g.mem_total);
     frame.render_widget(
@@ -609,8 +628,92 @@ fn render_gpu_procs(
 /// A single- or dual-series Braille line chart over the given owned point sets.
 /// When `y_labels` is non-empty, a left Y-axis with those tick labels is drawn
 /// (bottom-to-top) as a reading guide.
+/// Rows a chart needs before it gets a box: 2 border rows + 3 plot rows, so
+/// the boxed plot still has room for the 0 / mid / top labels.
+const CHART_BOX_MIN_H: u16 = 5;
+
+/// Y-axis tick labels that fit a plot `h` rows tall. The 0 baseline and the
+/// top value always stay visible (ratatui drops labels that do not fit, which
+/// used to hide the 0); the midpoint is added only when there is a row for it.
+fn y_labels(h: u16, top: String, mid: Option<String>) -> Vec<Line<'static>> {
+    match (h, mid) {
+        (0..=1, _) => Vec::new(),
+        (2, _) | (_, None) => vec![Line::from("0"), Line::from(top)],
+        (_, Some(mid)) => vec![Line::from("0"), Line::from(mid), Line::from(top)],
+    }
+}
+
+/// Draw a time-series chart into `area`: boxed with `title` (the series
+/// legend) when there is room, otherwise bare so small terminals keep the
+/// plot rows.
+fn render_chart(
+    frame: &mut Frame,
+    area: Rect,
+    series: &[(Color, &[(f64, f64)])],
+    y_max: f64,
+    top: String,
+    mid: Option<String>,
+    title: Line<'_>,
+) {
+    let boxed = area.height >= CHART_BOX_MIN_H && area.width >= 12;
+    let block = boxed.then(|| Block::bordered().title(title));
+    let plot_h = block.as_ref().map_or(area.height, |b| b.inner(area).height);
+    let mut chart = line_chart(series, y_max, y_labels(plot_h, top, mid));
+    if let Some(block) = block {
+        chart = chart.block(block);
+    }
+    frame.render_widget(chart, area);
+}
+
+/// Percent-scale chart (0 / 50 / 100).
+fn render_pct_chart(
+    frame: &mut Frame,
+    area: Rect,
+    series: &[(Color, &[(f64, f64)])],
+    title: Line<'_>,
+) {
+    render_chart(
+        frame,
+        area,
+        series,
+        100.0,
+        "100".into(),
+        Some("50".into()),
+        title,
+    );
+}
+
+/// Throughput chart scaled to the windowed `peak` (per second, unit implied).
+fn render_rate_chart(
+    frame: &mut Frame,
+    area: Rect,
+    series: &[(Color, &[(f64, f64)])],
+    peak: f64,
+    title: Line<'_>,
+) {
+    render_chart(
+        frame,
+        area,
+        series,
+        peak,
+        fmt_bytes(peak.max(0.0) as u64),
+        None,
+        title,
+    );
+}
+
+/// Two-series legend such as `usage / mem %`, each name in its line colour.
+fn legend(a: (&str, Color), b: (&str, Color), suffix: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(a.0.to_string(), Style::new().fg(a.1)),
+        Span::raw(" / "),
+        Span::styled(b.0.to_string(), Style::new().fg(b.1)),
+        Span::raw(suffix.to_string()),
+    ])
+}
+
 fn line_chart<'a>(
-    series: &'a [(Color, &'a [(f64, f64)])],
+    series: &[(Color, &'a [(f64, f64)])],
     y_max: f64,
     y_labels: Vec<Line<'a>>,
 ) -> Chart<'a> {
@@ -635,11 +738,6 @@ fn line_chart<'a>(
     Chart::new(datasets)
         .x_axis(Axis::default().bounds([0.0, (crate::model::HIST_CAP - 1) as f64]))
         .y_axis(y_axis)
-}
-
-/// `0 / 50 / 100` percent tick labels for a usage chart's Y-axis.
-fn pct_labels() -> Vec<Line<'static>> {
-    vec![Line::from("0"), Line::from("50"), Line::from("100")]
 }
 
 /// Per-thread bar width in the CPU topology grid.
@@ -674,37 +772,80 @@ fn multi_socket(groups: &[CoreGroup]) -> bool {
         .is_some_and(|f| groups.iter().any(|g| g.package != f.package))
 }
 
-/// Text rows the per-core grid needs: each socket starts a new row (prefixed
-/// with an `S<n>` label when multi-socket) and its cores wrap by width.
-fn cpu_core_rows(groups: &[CoreGroup], inner_w: usize) -> usize {
-    if groups.is_empty() {
-        return 1;
-    }
+/// Split cores into grid lines: each socket starts a new line (prefixed with
+/// an `S<n>` label when multi-socket) and its cores wrap by width. In the
+/// stacked layout a core's threads go on successive rows, so a core is only
+/// one thread wide.
+fn core_lines(groups: &[CoreGroup], inner_w: usize, stacked: bool) -> Vec<Range<usize>> {
     let lw = cpu_label_width(groups);
     let label_w = if multi_socket(groups) { 3 } else { 0 };
-    let mut rows = 0usize;
+    let cell_w = |g: &CoreGroup| {
+        if stacked {
+            lw + TH_W
+        } else {
+            core_cell_w(g.cpus.len(), lw)
+        }
+    };
+    let mut out = Vec::new();
+    let mut start = 0usize;
     let mut cur = 0usize;
-    let mut prev: Option<i64> = None;
-    for g in groups {
-        let cw = core_cell_w(g.cpus.len(), lw);
-        if prev != Some(g.package) {
-            rows += 1;
+    for (i, g) in groups.iter().enumerate() {
+        let cw = cell_w(g);
+        if i == 0 {
             cur = label_w + cw;
-            prev = Some(g.package);
-        } else if cur + 1 + cw > inner_w {
-            rows += 1;
+        } else if groups[i - 1].package != g.package || cur + 1 + cw > inner_w {
+            out.push(start..i);
+            start = i;
             cur = label_w + cw;
         } else {
             cur += 1 + cw;
         }
     }
-    rows.max(1)
+    if !groups.is_empty() {
+        out.push(start..groups.len());
+    }
+    out
 }
 
-/// `0 / peak` rate tick labels for a throughput chart's Y-axis (unit implied
-/// per second). The top label is the current windowed peak.
-fn rate_labels(peak: f64) -> Vec<Line<'static>> {
-    vec![Line::from("0"), Line::from(fmt_bytes(peak.max(0.0) as u64))]
+/// Text rows one grid line occupies: its widest core's thread count when
+/// stacked, otherwise 1.
+fn core_line_height(groups: &[CoreGroup], stacked: bool) -> usize {
+    if stacked {
+        groups
+            .iter()
+            .map(|g| g.cpus.len())
+            .max()
+            .unwrap_or(1)
+            .max(1)
+    } else {
+        1
+    }
+}
+
+/// Text rows the per-core grid needs in the given layout.
+fn cpu_core_rows(groups: &[CoreGroup], inner_w: usize, stacked: bool) -> usize {
+    core_lines(groups, inner_w, stacked)
+        .into_iter()
+        .map(|r| core_line_height(&groups[r], stacked))
+        .sum::<usize>()
+        .max(1)
+}
+
+/// Rows kept above the per-core grid (chart + gauges) before the stacked
+/// layout is allowed to claim space.
+const CPU_TOP_MIN: usize = 5;
+
+/// Choose the per-core grid layout for a CPU pane with `inner_h` text rows.
+/// With SMT, threads of a core are stacked vertically when that fits;
+/// otherwise they sit side by side on one row. Returns `(stacked, rows)`.
+fn cpu_grid_layout(groups: &[CoreGroup], inner_w: usize, inner_h: usize) -> (bool, usize) {
+    if groups.iter().any(|g| g.cpus.len() > 1) {
+        let rows = cpu_core_rows(groups, inner_w, true);
+        if rows + CPU_TOP_MIN <= inner_h {
+            return (true, rows);
+        }
+    }
+    (false, cpu_core_rows(groups, inner_w, false))
 }
 
 /// System hostname (read once from sysctl).
@@ -995,11 +1136,14 @@ fn render_cpu(frame: &mut Frame, area: Rect, cpu: &CpuSnapshot) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // Per-core topology grid: threads within a core joined by │, cores by ║,
-    // sockets split onto their own labelled rows. Height grows with core count.
-    let lw = cpu_label_width(&cpu.core_groups);
-    let multi = multi_socket(&cpu.core_groups);
-    let core_lines = cpu_core_rows(&cpu.core_groups, inner.width as usize)
+    // Per-core topology grid; sockets split onto their own labelled rows and
+    // height grows with core count. See `cpu_grid_lines` for the two layouts.
+    let (stacked, grid_rows) = cpu_grid_layout(
+        &cpu.core_groups,
+        inner.width as usize,
+        inner.height as usize,
+    );
+    let core_lines = grid_rows
         .min((inner.height as usize).saturating_sub(4))
         .max(1) as u16;
 
@@ -1010,22 +1154,25 @@ fn render_cpu(frame: &mut Frame, area: Rect, cpu: &CpuSnapshot) {
     let pts = cpu.usage_hist.points();
     let mem_pts = cpu.mem_hist.points();
     let series = [(Color::Cyan, pts), (Color::Magenta, mem_pts)];
-    let chart =
-        line_chart(&series, 100.0, pct_labels()).block(Block::bordered().title(Line::from(vec![
-            Span::styled("usage", Style::new().fg(Color::Cyan)),
-            Span::raw(" / "),
-            Span::styled("mem %", Style::new().fg(Color::Magenta)),
-        ])));
-    frame.render_widget(chart, top[0]);
+    render_pct_chart(
+        frame,
+        top[0],
+        &series,
+        legend(("usage", Color::Cyan), ("mem", Color::Magenta), " %"),
+    );
 
-    // RAM / Swap / memory detail / aggregate.
+    // RAM / Swap / memory detail / aggregate. When the chart is boxed, drop
+    // them one row so they line up with the plot rather than its border.
+    let pad = u16::from(top[0].height >= CHART_BOX_MIN_H && top[1].height >= 5);
     let g = Layout::vertical([
+        Constraint::Length(pad),
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
     ])
     .split(top[1]);
+    let g = &g[1..];
     let mem_pct = pct(cpu.mem_used, cpu.mem_total);
     frame.render_widget(
         Gauge::default()
@@ -1083,58 +1230,76 @@ fn render_cpu(frame: &mut Frame, area: Rect, cpu: &CpuSnapshot) {
     }
     frame.render_widget(Paragraph::new(Line::from(info)), g[3]);
 
-    // threads within a core: light │   cores: double ║   sockets: new row + label
+    let lines = cpu_grid_lines(cpu, inner.width as usize, stacked);
+    frame.render_widget(Paragraph::new(lines), rows[1]);
+}
+
+/// Build the per-core grid text.
+///
+/// Inline: threads within a core joined by light │, cores by double ║.
+/// Stacked: each core is a column with its threads on successive rows,
+/// cores separated by │ (non-SMT cores leave the lower rows blank).
+fn cpu_grid_lines(cpu: &CpuSnapshot, inner_w: usize, stacked: bool) -> Vec<Line<'static>> {
+    let groups = &cpu.core_groups;
+    let lw = cpu_label_width(groups);
+    let multi = multi_socket(groups);
     let core_sep = Style::new().fg(Color::Gray);
     let thread_sep = Style::new().fg(Color::DarkGray);
     let socket_lbl = Style::new().fg(Color::Yellow);
-    let inner_w = inner.width as usize;
-    let label_w = if multi { 3 } else { 0 };
-    let mut lines: Vec<Line> = Vec::new();
-    let mut spans: Vec<Span> = Vec::new();
-    let mut cur_w = 0usize;
+    let dim = Style::new().add_modifier(Modifier::DIM);
+    let push_thread = |spans: &mut Vec<Span<'static>>, lcpu: usize| {
+        let u = cpu.per_core.get(lcpu).copied().unwrap_or(0.0);
+        spans.push(Span::styled(format!("{lcpu:>lw$}"), dim));
+        spans.push(Span::styled(hbar(u, TH_W), Style::new().fg(usage_color(u))));
+    };
+
+    let mut lines = Vec::new();
     let mut prev: Option<i64> = None;
-    for group in &cpu.core_groups {
-        let cw = core_cell_w(group.cpus.len(), lw);
-        if prev != Some(group.package) {
-            // New socket: flush the current row and start a fresh, labelled one.
-            if !spans.is_empty() {
-                lines.push(Line::from(std::mem::take(&mut spans)));
-            }
-            cur_w = 0;
+    for range in core_lines(groups, inner_w, stacked) {
+        let line = &groups[range];
+        let new_socket = prev != Some(line[0].package);
+        prev = Some(line[0].package);
+        for row in 0..core_line_height(line, stacked) {
+            let mut spans: Vec<Span<'static>> = Vec::new();
             if multi {
-                spans.push(Span::styled(format!("S{} ", group.package), socket_lbl));
-                cur_w += label_w;
+                if new_socket && row == 0 {
+                    spans.push(Span::styled(format!("S{} ", line[0].package), socket_lbl));
+                } else {
+                    // Wrapped/stacked rows indent under the socket label.
+                    spans.push(Span::raw("   "));
+                }
             }
-            prev = Some(group.package);
-        } else if cur_w + 1 + cw > inner_w {
-            // Wrap within the same socket; indent under the socket label.
-            lines.push(Line::from(std::mem::take(&mut spans)));
-            cur_w = 0;
-            if multi {
-                spans.push(Span::raw("   "));
-                cur_w += label_w;
+            for (ci, group) in line.iter().enumerate() {
+                if stacked {
+                    if ci > 0 {
+                        // Draw the divider only where a neighbour has this row.
+                        let edge = line[ci - 1].cpus.len() > row || group.cpus.len() > row;
+                        spans.push(if edge {
+                            Span::styled("│", core_sep)
+                        } else {
+                            Span::raw(" ")
+                        });
+                    }
+                    match group.cpus.get(row) {
+                        Some(&lcpu) => push_thread(&mut spans, lcpu),
+                        None => spans.push(Span::raw(" ".repeat(lw + TH_W))),
+                    }
+                } else {
+                    if ci > 0 {
+                        spans.push(Span::styled("║", core_sep));
+                    }
+                    for (ti, &lcpu) in group.cpus.iter().enumerate() {
+                        if ti > 0 {
+                            spans.push(Span::styled("│", thread_sep));
+                        }
+                        push_thread(&mut spans, lcpu);
+                    }
+                }
             }
-        } else {
-            spans.push(Span::styled("║", core_sep));
-            cur_w += 1;
+            lines.push(Line::from(spans));
         }
-        for (ti, &lcpu) in group.cpus.iter().enumerate() {
-            if ti > 0 {
-                spans.push(Span::styled("│", thread_sep));
-            }
-            let u = cpu.per_core.get(lcpu).copied().unwrap_or(0.0);
-            spans.push(Span::styled(
-                format!("{lcpu:>lw$}"),
-                Style::new().add_modifier(Modifier::DIM),
-            ));
-            spans.push(Span::styled(hbar(u, TH_W), Style::new().fg(usage_color(u))));
-        }
-        cur_w += cw;
     }
-    if !spans.is_empty() {
-        lines.push(Line::from(spans));
-    }
-    frame.render_widget(Paragraph::new(lines), rows[1]);
+    lines
 }
 
 fn render_gpus(frame: &mut Frame, area: Rect, gpus: &[&GpuSnapshot]) {
@@ -1189,8 +1354,14 @@ fn render_gpu_card(frame: &mut Frame, area: Rect, g: &GpuSnapshot) {
 
     let pts = g.util_hist.points();
     let vram_pts = g.vram_hist.points();
-    let series = [(usage_color(g.busy_pct), pts), (Color::Blue, vram_pts)];
-    frame.render_widget(line_chart(&series, 100.0, pct_labels()), rows[0]);
+    let util_c = usage_color(g.busy_pct);
+    let series = [(util_c, pts), (Color::Blue, vram_pts)];
+    render_pct_chart(
+        frame,
+        rows[0],
+        &series,
+        legend(("util", util_c), ("vram", Color::Blue), " %"),
+    );
 
     let vram_pct = pct(g.mem_used, g.mem_total);
     frame.render_widget(
@@ -1343,13 +1514,21 @@ fn render_net(frame: &mut Frame, area: Rect, net: &[NetSnapshot]) {
         let rx = top.rx_hist.points();
         let tx = top.tx_hist.points();
         let ymax = top.rx_hist.max().max(top.tx_hist.max());
-        frame.render_widget(
-            line_chart(
-                &[(Color::Green, rx), (Color::Blue, tx)],
-                ymax,
-                rate_labels(ymax),
+        let title = Line::from(vec![
+            Span::styled(
+                format!(" {} ", clean_text(&top.iface)),
+                Style::new().add_modifier(Modifier::DIM),
             ),
+            Span::styled("▼rx", Style::new().fg(Color::Green)),
+            Span::raw(" "),
+            Span::styled("▲tx ", Style::new().fg(Color::Blue)),
+        ]);
+        render_rate_chart(
+            frame,
             parts[1],
+            &[(Color::Green, rx), (Color::Blue, tx)],
+            ymax,
+            title,
         );
     }
 }
@@ -1402,23 +1581,26 @@ fn render_disk(frame: &mut Frame, area: Rect, disk: &[DiskSnapshot]) {
         let r = top.r_hist.points();
         let w = top.w_hist.points();
         let ymax = top.r_hist.max().max(top.w_hist.max());
-        let iops_title = Line::from(Span::styled(
-            format!(
-                " {} {:.0}/{:.0} iops ",
-                clean_text(&top.dev),
-                top.r_iops,
-                top.w_iops
+        let title = Line::from(vec![
+            Span::styled(
+                format!(
+                    " {} {:.0}/{:.0} iops ",
+                    clean_text(&top.dev),
+                    top.r_iops,
+                    top.w_iops
+                ),
+                Style::new().add_modifier(Modifier::DIM),
             ),
-            Style::new().add_modifier(Modifier::DIM),
-        ));
-        frame.render_widget(
-            line_chart(
-                &[(Color::Cyan, r), (Color::Magenta, w)],
-                ymax,
-                rate_labels(ymax),
-            )
-            .block(Block::default().title(iops_title)),
+            Span::styled("R", Style::new().fg(Color::Cyan)),
+            Span::raw(" "),
+            Span::styled("W ", Style::new().fg(Color::Magenta)),
+        ]);
+        render_rate_chart(
+            frame,
             parts[1],
+            &[(Color::Cyan, r), (Color::Magenta, w)],
+            ymax,
+            title,
         );
     }
 }
@@ -1870,6 +2052,140 @@ mod tests {
         let text = render_to_text(&synth(groups, 4), 90, 14);
         eprintln!("---- single socket ----\n{text}");
         assert!(!text.contains("S0"), "single socket should not be labelled");
+    }
+
+    /// Hybrid part: two 2-thread cores (cpu 0..4) then two 1-thread cores.
+    fn hybrid_groups() -> Vec<CoreGroup> {
+        vec![
+            CoreGroup {
+                package: 0,
+                cpus: vec![0, 1],
+            },
+            CoreGroup {
+                package: 0,
+                cpus: vec![2, 3],
+            },
+            CoreGroup {
+                package: 0,
+                cpus: vec![4],
+            },
+            CoreGroup {
+                package: 0,
+                cpus: vec![5],
+            },
+        ]
+    }
+
+    #[test]
+    fn smt_threads_stack_vertically_when_room() {
+        let text = render_to_text(&synth(hybrid_groups(), 6), 90, 14);
+        eprintln!("---- stacked ----\n{text}");
+        let lines: Vec<String> = cpu_grid_lines(&synth(hybrid_groups(), 6), 88, true)
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert_eq!(lines.len(), 2);
+        // (row, char column) of a cpu-index label.
+        let pos = |d: char| {
+            lines
+                .iter()
+                .enumerate()
+                .find_map(|(r, l)| l.chars().position(|c| c == d).map(|c| (r, c)))
+                .unwrap()
+        };
+        // Siblings share a column on consecutive rows; 1-thread cores sit on row 0.
+        assert_eq!(pos('1'), (1, pos('0').1));
+        assert_eq!(pos('3'), (1, pos('2').1));
+        assert_eq!(pos('4').0, 0);
+        assert_eq!(pos('5').0, 0);
+        // Row 1 has no divider past the last SMT core.
+        assert_eq!(lines[1].trim_end().matches('│').count(), 2);
+    }
+
+    #[test]
+    fn smt_threads_inline_when_short() {
+        let groups = hybrid_groups();
+        assert_eq!(cpu_grid_layout(&groups, 88, 6), (false, 1));
+        assert_eq!(cpu_grid_layout(&groups, 88, 7), (true, 2));
+        // No SMT: never stacked.
+        let flat: Vec<CoreGroup> = (0..4)
+            .map(|i| CoreGroup {
+                package: 0,
+                cpus: vec![i],
+            })
+            .collect();
+        assert!(!cpu_grid_layout(&flat, 88, 40).0);
+    }
+
+    /// Row of the first line containing `needle`.
+    fn row_of(text: &str, needle: &str) -> usize {
+        text.lines().position(|l| l.contains(needle)).unwrap()
+    }
+
+    #[test]
+    fn overview_without_gpus_collapses_gpu_tier() {
+        let state = SharedState::default();
+        state.cpu.store(Some(std::sync::Arc::new(Stamped::new(synth(
+            hybrid_groups(),
+            6,
+        )))));
+        let t = full_to_text(&state, &View::default(), 100, 50);
+        eprintln!("---- no gpu ----\n{t}");
+        // RAM gauge sits level with the boxed chart's top plot row.
+        assert_eq!(row_of(&t, "RAM "), row_of(&t, "│100│"));
+
+        // Border + one message line + border.
+        let msg = row_of(&t, "No GPUs detected");
+        assert!(t.lines().nth(msg - 1).unwrap().contains(" GPU "));
+        assert!(t.lines().nth(msg + 1).unwrap().contains('└'));
+
+        // With a GPU the tier keeps its flexible share instead.
+        state
+            .nvidia
+            .store(Some(std::sync::Arc::new(Stamped::new(vec![gpu_snap(
+                GpuVendor::Nvidia,
+                0,
+                "TestGPU",
+            )]))));
+        let with_gpu = full_to_text(&state, &View::default(), 100, 50);
+        assert!(row_of(&with_gpu, "TestGPU") < row_of(&t, " GPU "));
+    }
+
+    #[test]
+    fn y_labels_keep_zero_and_top_visible() {
+        let text = |v: Vec<Line>| v.iter().map(|l| l.to_string()).collect::<Vec<_>>();
+        let pct = |h| text(y_labels(h, "100".into(), Some("50".into())));
+        assert!(pct(1).is_empty());
+        assert_eq!(pct(2), ["0", "100"]);
+        assert_eq!(pct(3), ["0", "50", "100"]);
+        assert_eq!(text(y_labels(5, "1.0M".into(), None)), ["0", "1.0M"]);
+    }
+
+    #[test]
+    fn short_gpu_card_chart_still_shows_zero_baseline() {
+        // 80x24: the GPU card chart gets only 2 rows — too small for a box,
+        // but both the 0 and 100 labels must remain.
+        let state = SharedState::default();
+        state.cpu.store(Some(std::sync::Arc::new(Stamped::new(synth(
+            hybrid_groups(),
+            6,
+        )))));
+        state
+            .nvidia
+            .store(Some(std::sync::Arc::new(Stamped::new(vec![gpu_snap(
+                GpuVendor::Nvidia,
+                0,
+                "TestGPU",
+            )]))));
+        let t = full_to_text(&state, &View::default(), 80, 24);
+        let card: Vec<&str> = t.lines().skip(row_of(&t, "TestGPU") + 1).take(2).collect();
+        assert!(card[0].starts_with("│100│"), "{t}");
+        assert!(card[1].starts_with("│0  │"), "{t}");
+        assert_eq!(row_of(&t, "RAM "), row_of(&t, "│100│"), "{t}");
+
+        // Taller card: the chart is boxed with its series legend.
+        let t = full_to_text(&state, &View::default(), 100, 40);
+        assert!(t.contains("util / vram %"), "{t}");
     }
 
     /// Minimal GPU snapshot for tab-render tests.
