@@ -1,6 +1,7 @@
 //! CPU / memory collector, reading `/proc` directly (no libraries).
 
 use std::fs;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::Collector;
@@ -86,26 +87,7 @@ impl Collector for CpuCollector {
 
     fn sample(&mut self) -> anyhow::Result<CpuSnapshot> {
         let stat = fs::read_to_string("/proc/stat")?;
-        let mut agg = CpuTimes::default();
-        let mut cores: Vec<CpuTimes> = Vec::new();
-
-        for line in stat.lines() {
-            if let Some(rest) = line.strip_prefix("cpu") {
-                if let Some(fields) = rest.strip_prefix(' ') {
-                    // aggregate "cpu  ..."
-                    if let Some(t) = CpuTimes::parse(fields) {
-                        agg = t;
-                    }
-                } else if let Some((_idx, fields)) = rest.split_once(' ') {
-                    // per-core "cpuN ..."
-                    if let Some(t) = CpuTimes::parse(fields) {
-                        cores.push(t);
-                    }
-                }
-            } else {
-                break; // cpu lines are at the top of /proc/stat
-            }
-        }
+        let (agg, cores) = parse_stat(&stat);
 
         if self.prev_cores.len() != cores.len() {
             self.prev_cores = vec![CpuTimes::default(); cores.len()];
@@ -172,13 +154,67 @@ impl Collector for CpuCollector {
     }
 }
 
-/// Group logical CPUs by physical core via sysfs topology, ordered by
-/// `(package, core_id, cpu)`. Falls back to one-cpu-per-group if unavailable.
+/// Parse the aggregate and per-CPU counters from `/proc/stat`. Per-CPU
+/// entries are placed at their `cpuN` index, not their line position:
+/// offline CPUs are omitted from `/proc/stat`, so positions would shift every
+/// later CPU's usage onto the wrong label. Gaps stay zeroed.
+fn parse_stat(stat: &str) -> (CpuTimes, Vec<CpuTimes>) {
+    let mut agg = CpuTimes::default();
+    let mut cores: Vec<CpuTimes> = Vec::new();
+    for line in stat.lines() {
+        let Some(rest) = line.strip_prefix("cpu") else {
+            break; // cpu lines are at the top of /proc/stat
+        };
+        if let Some(fields) = rest.strip_prefix(' ') {
+            // aggregate "cpu  ..."
+            if let Some(t) = CpuTimes::parse(fields) {
+                agg = t;
+            }
+        } else if let Some((idx, fields)) = rest.split_once(' ')
+            && let Ok(i) = idx.parse::<usize>()
+            && let Some(t) = CpuTimes::parse(fields)
+        {
+            if cores.len() <= i {
+                cores.resize(i + 1, CpuTimes::default());
+            }
+            cores[i] = t;
+        }
+    }
+    (agg, cores)
+}
+
+/// Parse a kernel cpulist such as `0-3,8,10-11`.
+fn parse_cpulist(s: &str) -> Option<Vec<usize>> {
+    let mut out = Vec::new();
+    for part in s.trim().split(',').filter(|p| !p.is_empty()) {
+        match part.split_once('-') {
+            Some((a, b)) => {
+                let (a, b) = (a.parse::<usize>().ok()?, b.parse::<usize>().ok()?);
+                out.extend(a..=b);
+            }
+            None => out.push(part.parse().ok()?),
+        }
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
 fn read_topology() -> Vec<CoreGroup> {
-    use std::collections::BTreeMap;
+    read_topology_from(Path::new("/sys/devices/system/cpu"))
+}
+
+/// Group online logical CPUs by physical core via sysfs topology, ordered by
+/// `(package, die, core_id, cpu)`.
+///
+/// SMT siblings come from `core_cpus_list` (`thread_siblings_list` on older
+/// kernels) rather than `(package, core_id)`: `core_id` is only unique per die,
+/// so on multi-die packages distinct cores would otherwise merge. Offline
+/// CPUs (no topology directory, or `online` = 0) are left out. Falls back to
+/// one-cpu-per-group if topology is unavailable.
+fn read_topology_from(root: &Path) -> Vec<CoreGroup> {
+    use std::collections::{BTreeMap, BTreeSet};
 
     let mut cpus: Vec<usize> = Vec::new();
-    if let Ok(rd) = fs::read_dir("/sys/devices/system/cpu") {
+    if let Ok(rd) = fs::read_dir(root) {
         for entry in rd.flatten() {
             let name = entry.file_name();
             let name = name.to_string_lossy();
@@ -191,32 +227,55 @@ fn read_topology() -> Vec<CoreGroup> {
     }
     cpus.sort_unstable();
 
-    // Keyed by (package, core_id); package distinguishes sockets so cores with
-    // duplicate core_ids across sockets stay separate.
-    let mut groups: BTreeMap<(i64, i64), Vec<usize>> = BTreeMap::new();
+    let read = |path: PathBuf| fs::read_to_string(path).ok();
+    let online: Vec<usize> = cpus
+        .iter()
+        .copied()
+        .filter(|cpu| {
+            // cpu0 often has no `online` file; absent means online.
+            read(root.join(format!("cpu{cpu}/online"))).is_none_or(|s| s.trim() != "0")
+        })
+        .collect();
+
+    // Keyed for display order; each sibling set is emitted once (by its
+    // first online member).
+    let mut groups: BTreeMap<(i64, i64, i64, usize), CoreGroup> = BTreeMap::new();
+    let mut seen: BTreeSet<Vec<usize>> = BTreeSet::new();
     let mut any_topology = false;
-    for &cpu in &cpus {
-        let base = format!("/sys/devices/system/cpu/cpu{cpu}/topology");
-        let read = |f: &str| -> Option<i64> {
-            fs::read_to_string(format!("{base}/{f}"))
-                .ok()?
-                .trim()
-                .parse()
-                .ok()
-        };
-        match (read("physical_package_id"), read("core_id")) {
-            (Some(pkg), Some(core)) => {
-                groups.entry((pkg, core)).or_default().push(cpu);
-                any_topology = true;
-            }
-            _ => {
-                groups.entry((0, cpu as i64)).or_default().push(cpu);
-            }
+    for &cpu in &online {
+        let topo = root.join(format!("cpu{cpu}/topology"));
+        let num = |f: &str| -> Option<i64> { read(topo.join(f))?.trim().parse().ok() };
+        // Online but no topology (e.g. some VMs/containers): its own core in
+        // package 0; the sibling fallback below keeps it a single-cpu group.
+        let pkg = num("physical_package_id");
+        any_topology |= pkg.is_some();
+        let pkg = pkg.unwrap_or(0);
+        let siblings = read(topo.join("core_cpus_list"))
+            .or_else(|| read(topo.join("thread_siblings_list")))
+            .and_then(|s| parse_cpulist(&s))
+            .map(|l| {
+                let mut l: Vec<usize> = l.into_iter().filter(|c| online.contains(c)).collect();
+                l.sort_unstable();
+                l
+            })
+            .filter(|l| l.contains(&cpu))
+            .unwrap_or_else(|| vec![cpu]);
+        if !seen.insert(siblings.clone()) {
+            continue;
         }
+        let die = num("die_id").unwrap_or(0);
+        let core = num("core_id").unwrap_or(cpu as i64);
+        groups.insert(
+            (pkg, die, core, siblings[0]),
+            CoreGroup {
+                package: pkg,
+                cpus: siblings,
+            },
+        );
     }
 
     if !any_topology {
-        return cpus
+        return online
             .iter()
             .map(|&i| CoreGroup {
                 package: 0,
@@ -224,10 +283,7 @@ fn read_topology() -> Vec<CoreGroup> {
             })
             .collect();
     }
-    groups
-        .into_iter()
-        .map(|((package, _core), cpus)| CoreGroup { package, cpus })
-        .collect()
+    groups.into_values().collect()
 }
 
 /// CPU package temperature in °C from hwmon (`coretemp`/`k10temp`/`zenpower`).
@@ -353,7 +409,100 @@ fn read_loadavg() -> ([f32; 3], u32, u32) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
+
+    static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "smtop-cpu-{}-{}",
+                std::process::id(),
+                NEXT_TMP.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Fake `/sys/devices/system/cpu/cpuN`. `topo` = (package, die, core, siblings).
+    fn fixture_cpu(root: &Path, cpu: usize, topo: Option<(i64, i64, i64, &str)>) {
+        let dir = root.join(format!("cpu{cpu}"));
+        fs::create_dir_all(&dir).unwrap();
+        if let Some((pkg, die, core, sib)) = topo {
+            let t = dir.join("topology");
+            fs::create_dir_all(&t).unwrap();
+            fs::write(t.join("physical_package_id"), format!("{pkg}\n")).unwrap();
+            fs::write(t.join("die_id"), format!("{die}\n")).unwrap();
+            fs::write(t.join("core_id"), format!("{core}\n")).unwrap();
+            fs::write(t.join("core_cpus_list"), format!("{sib}\n")).unwrap();
+        }
+    }
+
+    fn cpus_of(groups: &[CoreGroup]) -> Vec<Vec<usize>> {
+        groups.iter().map(|g| g.cpus.clone()).collect()
+    }
+
+    #[test]
+    fn stat_places_cpus_by_index_across_offline_gaps() {
+        let stat = "cpu  30 0 0 60 0 0 0 0\n\
+                    cpu0 10 0 0 20 0 0 0 0\n\
+                    cpu3 20 0 0 40 0 0 0 0\n\
+                    intr 1 2 3\n";
+        let (agg, cores) = parse_stat(stat);
+        assert_eq!(agg.total, 90);
+        assert_eq!(cores.len(), 4);
+        assert_eq!(cores[0].total, 30);
+        assert_eq!(cores[1].total, 0); // offline gap stays zeroed
+        assert_eq!(cores[3].total, 60);
+    }
+
+    #[test]
+    fn cpulist_parses_ranges_and_singles() {
+        assert_eq!(
+            parse_cpulist("0-2,8,10-11\n"),
+            Some(vec![0, 1, 2, 8, 10, 11])
+        );
+        assert_eq!(parse_cpulist("5"), Some(vec![5]));
+        assert_eq!(parse_cpulist(""), None);
+        assert_eq!(parse_cpulist("x"), None);
+    }
+
+    #[test]
+    fn topology_groups_by_sibling_list_not_core_id() {
+        // One package, two dies, both reusing core_id 0: must stay two cores.
+        let d = TestDir::new();
+        fixture_cpu(&d.0, 0, Some((0, 0, 0, "0,2")));
+        fixture_cpu(&d.0, 1, Some((0, 1, 0, "1,3")));
+        fixture_cpu(&d.0, 2, Some((0, 0, 0, "0,2")));
+        fixture_cpu(&d.0, 3, Some((0, 1, 0, "1,3")));
+        let g = read_topology_from(&d.0);
+        assert_eq!(cpus_of(&g), vec![vec![0, 2], vec![1, 3]]);
+    }
+
+    #[test]
+    fn topology_skips_offline_and_keeps_topologyless_cpus_separate() {
+        // cpu1 offline (sibling of cpu0); cpu2 online without topology must
+        // not merge with the real core_id 2 on cpu3.
+        let d = TestDir::new();
+        fixture_cpu(&d.0, 0, Some((0, 0, 0, "0")));
+        fixture_cpu(&d.0, 1, None);
+        fs::write(d.0.join("cpu1/online"), "0\n").unwrap();
+        fixture_cpu(&d.0, 2, None);
+        fixture_cpu(&d.0, 3, Some((0, 0, 2, "3")));
+        let g = read_topology_from(&d.0);
+        assert_eq!(cpus_of(&g), vec![vec![0], vec![2], vec![3]]);
+    }
 
     #[test]
     fn cpu_times_parse_idle_and_total() {
